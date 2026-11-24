@@ -146,6 +146,10 @@ class TestToolsFiles(unittest.TestCase):
             with self.assertRaises(ValueError):
                 tools_files.fix_zip_encoding(str(bad_file), out_dir=out_dir)
 
+            # 非法源编码名应抛出友好 ValueError 而非 LookupError
+            with self.assertRaises(ValueError):
+                tools_files.fix_zip_encoding(str(src_zip), source_encoding='not_a_real_enc', out_dir=out_dir)
+
     def test_fix_text_encoding_gbk_to_utf8_bom_and_errors(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp) / '中文路径'
@@ -299,6 +303,17 @@ class TestToolsPdf(unittest.TestCase):
             self.assertFalse(dec_info['is_encrypted'])
             self.assertEqual(dec_info['pages'], 1)
 
+    def test_images_to_pdf_transparent_png_has_white_background(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            trans_png = base / '透明图.png'
+            Image.new('RGBA', (80, 80), (0, 0, 0, 0)).save(trans_png)
+            res = tools_pdf.images_to_pdf([str(trans_png)], out_dir=base)
+            with pymupdf.open(res['path']) as doc:
+                pix = doc[0].get_pixmap(dpi=72)
+                r, g, b = pix.pixel(40, 40)[:3]
+                self.assertGreaterEqual(min(r, g, b), 245)
+
 
 class TestToolsVideo(unittest.TestCase):
     """时间解析、视频任务并发上限、旋转指令构建与字幕互转。"""
@@ -370,6 +385,39 @@ class TestToolsVideo(unittest.TestCase):
             empty_sub.write_text('', encoding='utf-8')
             with self.assertRaises(ValueError):
                 tools_video.convert_subtitle(str(empty_sub), target_fmt='vtt', out_dir=base)
+
+            # 空行含空格的 SRT 与 UTF-16 BOM 字幕均应正确分块解析
+            sp_sub = base / 'space_blank.srt'
+            sp_sub.write_text(
+                '1\n00:00:01,000 --> 00:00:02,000\n第一句\n \n2\n00:00:03,000 --> 00:00:04,000\n第二句\n',
+                encoding='utf-8',
+            )
+            sp_res = tools_video.convert_subtitle(str(sp_sub), target_fmt='vtt', out_dir=base)
+            self.assertEqual(sp_res['cues'], 2)
+
+            u16_sub = base / 'utf16.srt'
+            u16_sub.write_bytes('1\n00:00:01,000 --> 00:00:02,000\n你好世界\n'.encode('utf-16'))
+            u16_res = tools_video.convert_subtitle(str(u16_sub), target_fmt='vtt', out_dir=base)
+            self.assertEqual(u16_res['cues'], 1)
+            self.assertEqual(u16_res['detected_encoding'], 'utf-16')
+
+    def test_export_video_frames_interval_exceeds_duration_does_not_crash(self):
+        ffmpeg, _ = tools_video.ffmpeg_bins()
+        if not ffmpeg:
+            self.skipTest('未安装 FFmpeg')
+        import subprocess
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            clip = base / '短片.mp4'
+            subprocess.run(
+                [ffmpeg, '-y', '-hide_banner', '-loglevel', 'error',
+                 '-f', 'lavfi', '-i', 'testsrc=duration=1:size=160x120:rate=25',
+                 '-c:v', 'libx264', '-pix_fmt', 'yuv420p', str(clip)],
+                check=True,
+            )
+            res = tools_video.export_video_frames(str(clip), mode='interval', interval=5.0, fmt='jpg', out_dir=base)
+            self.assertGreaterEqual(res['count'], 1)
+            self.assertTrue(Path(res['path']).exists())
 
 
 if __name__ == '__main__':

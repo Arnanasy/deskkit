@@ -15,6 +15,7 @@ const state = {
   videoTaskId: '',
   videoPoll: null,
   videoMergeFiles: [],
+  videoMergeTaskId: '',
   videoMergePoll: null,
   videoSubPath: '',
   imageFiles: [],
@@ -329,9 +330,9 @@ setupDropzone($('#video-drop'), async (files) => {
   } catch (err) { toast(err.message); }
 });
 
-function pollVideoTask(task, ui, pollKey) {
+function pollVideoTask(task, ui, pollKey, taskKey = 'videoTaskId') {
   clearInterval(state[pollKey]);
-  state.videoTaskId = task.id;
+  state[taskKey] = task.id;
   ui.box.style.display = 'block';
   ui.desc.textContent = task.mode_desc;
   ui.bar.style.width = '2%';
@@ -498,7 +499,7 @@ $('#btn-run-vmerge').onclick = async () => {
       stat: $('#vmp-stat'),
       actions: $('#vmp-actions'),
       preview: $('#vmp-preview'),
-    }, 'videoMergePoll');
+    }, 'videoMergePoll', 'videoMergeTaskId');
   } catch (e) { toast(e.message); }
 };
 
@@ -555,7 +556,7 @@ function renderFileList(el, arr, onChange, showThumb = false, sortable = true) {
     <div class="file-item" ${sortable ? `draggable="true" data-idx="${idx}"` : ''}>
       <div class="row" style="gap:10px; min-width:0; flex:1;">
         ${sortable ? '<span class="drag-handle" title="拖拽可调整顺序">⋮⋮</span>' : ''}
-        ${showThumb ? `<img class="thumb-mini" src="${previewUrl(f.path)}" alt="" onerror="this.style.display='none'">` : ''}
+        ${showThumb ? `<img class="thumb-mini" src="${previewUrl(f.path)}" alt="">` : ''}
         <div style="min-width:0; word-break:break-all;"><strong>${idx + 1}. ${escHtml(f.name)}</strong> <span class="meta">${f.size ? fmtBytes(f.size) : ''}</span></div>
       </div>
       <div class="item-actions">
@@ -564,6 +565,10 @@ function renderFileList(el, arr, onChange, showThumb = false, sortable = true) {
         <button class="btn btn-sm js-del" data-idx="${idx}">移除</button>
       </div>
     </div>`).join('');
+
+  el.querySelectorAll('.thumb-mini').forEach((img) => {
+    img.addEventListener('error', () => { img.style.display = 'none'; });
+  });
 
   el.querySelectorAll('.js-del').forEach((b) => {
     b.onclick = () => { arr.splice(Number(b.dataset.idx), 1); onChange(); };
@@ -832,7 +837,7 @@ $('#btn-pdf-img-run').onclick = async () => {
 $('#btn-pfi-pick').onclick = async (e) => {
   e.stopPropagation();
   try {
-    const res = await api('/api/pick-files', { title: '选择多张图片', filetypes: [['图片文件', '*.png *.jpg *.jpeg *.webp *.avif *.bmp']], multiple: true });
+    const res = await api('/api/pick-files', { title: '选择多张图片', filetypes: [['图片文件', '*.png *.jpg *.jpeg *.webp *.heic *.heif *.avif *.bmp']], multiple: true });
     res.files.forEach((p) => state.pdfFromImgFiles.push({ path: p, name: p.split(/[\\/]/).pop() }));
     refreshPfi();
   } catch (err) { toast(err.message); }
@@ -1050,13 +1055,32 @@ function updateTs() {
   if (Number.isNaN(d.getTime())) { $('#ts-out').textContent = '时间戳超出有效范围'; return; }
   $('#ts-out').textContent = `${formatLocalDateTime(d)}（ISO: ${d.toISOString()}）`;
 }
+function parseLocalDateTimeInput(raw) {
+  const s = (raw || '').trim();
+  // 优先按本地时区解析 YYYY-M-D [H:m[:s[.ms]]]（支持 - 或 / 分隔，避免纯日期被 JS 当作 UTC 产生 8 小时偏差）
+  const m = /^(\d{4})[-/](\d{1,2})[-/](\d{1,2})(?:[T\s]+(\d{1,2}):(\d{1,2})(?::(\d{1,2})(?:\.(\d{1,3}))?)?)?$/.exec(s);
+  if (m) {
+    const y = Number(m[1]), mo = Number(m[2]), day = Number(m[3]);
+    const hh = m[4] !== undefined ? Number(m[4]) : 0;
+    const mm = m[5] !== undefined ? Number(m[5]) : 0;
+    const ss = m[6] !== undefined ? Number(m[6]) : 0;
+    const ms = m[7] !== undefined ? Number(m[7].padEnd(3, '0')) : 0;
+    const d = new Date(y, mo - 1, day, hh, mm, ss, ms);
+    if (d.getFullYear() === y && d.getMonth() === mo - 1 && d.getDate() === day
+        && d.getHours() === hh && d.getMinutes() === mm && d.getSeconds() === ss) {
+      return d;
+    }
+    return null;
+  }
+  // 带显式时区（如 Z / +08:00）的 ISO 字符串交由 Date 原生解析
+  const fallback = new Date(s);
+  return Number.isNaN(fallback.getTime()) ? null : fallback;
+}
 function updateDateToTs() {
   const raw = $('#ts-date-in').value.trim();
   if (!raw) { $('#ts-date-out').textContent = '—'; state.tsLastSec = ''; state.tsLastMs = ''; return; }
-  // 兼容 YYYY-MM-DD HH:mm:ss 或 YYYY/MM/DD HH:mm:ss 或 ISO 字符串
-  const normalized = raw.replace(/\//g, '-').replace(' ', 'T');
-  const d = new Date(normalized);
-  if (Number.isNaN(d.getTime())) {
+  const d = parseLocalDateTimeInput(raw);
+  if (!d) {
     $('#ts-date-out').textContent = '日期格式无法识别，示例：2026-11-25 12:30:00';
     state.tsLastSec = '';
     state.tsLastMs = '';
@@ -1325,8 +1349,8 @@ function calcLoan() {
   const years = Math.max(1, Math.min(40, Number($('#ln-years').value) || 30));
   const n = years * 12;
   const prepay = Math.max(0, Number($('#ln-prepay').value) || 0) * 10000;
-  const preYear = Math.max(1, Number($('#ln-preyear').value) || 3);
-  const preMonth = Math.min(n - 1, preYear * 12);
+  const preYear = Math.max(1, Math.floor(Number($('#ln-preyear').value) || 3));
+  const preMonth = preYear * 12;
 
   if (P <= 0) {
     $('#ln-out').innerHTML = '';
@@ -1339,7 +1363,8 @@ function calcLoan() {
   let totalInterest = 0;
   let remain = 0;
   let oldLeftInterest = 0;
-  const leftN = n - preMonth;
+  const invalidPreYear = preMonth >= n;
+  const leftN = Math.max(0, n - preMonth);
 
   // 方案 A（年限不变、减月供）与 方案 B（月供不变、缩年限）
   let newFirstA = 0, savedA = 0;
@@ -1350,12 +1375,12 @@ function calcLoan() {
     origFirstLabel = '原月供（等额本息）';
     origFirstVal = monthly;
     totalInterest = monthly * n - P;
-    remain = r > 0
+    remain = invalidPreYear ? 0 : (r > 0
       ? P * (Math.pow(1 + r, n) - Math.pow(1 + r, preMonth)) / (Math.pow(1 + r, n) - 1)
-      : P * (1 - preMonth / n);
-    oldLeftInterest = Math.max(0, monthly * leftN - remain);
+      : P * (1 - preMonth / n));
+    oldLeftInterest = invalidPreYear ? 0 : Math.max(0, monthly * leftN - remain);
 
-    if (prepay > 0 && remain > 0) {
+    if (!invalidPreYear && prepay > 0 && remain > 0) {
       const afterP = Math.max(0, remain - prepay);
       // 方案 A：年限不变，减少月供
       newFirstA = afterP > 0
@@ -1394,10 +1419,10 @@ function calcLoan() {
     origFirstLabel = `原首月月供（月减 ¥${dec.toFixed(1)}）`;
     origFirstVal = firstM;
     totalInterest = P * r * (n + 1) / 2;
-    remain = Math.max(0, P - mp * preMonth);
-    oldLeftInterest = remain * r * (leftN + 1) / 2;
+    remain = invalidPreYear ? 0 : Math.max(0, P - mp * preMonth);
+    oldLeftInterest = invalidPreYear ? 0 : remain * r * (leftN + 1) / 2;
 
-    if (prepay > 0 && remain > 0) {
+    if (!invalidPreYear && prepay > 0 && remain > 0) {
       const afterP = Math.max(0, remain - prepay);
       // 方案 A：年限不变，降低每月还本额
       const newMp = afterP / leftN;
@@ -1435,6 +1460,10 @@ function calcLoan() {
 
   if (prepay <= 0) {
     $('#ln-compare').innerHTML = '';
+    return;
+  }
+  if (invalidPreYear) {
+    $('#ln-compare').innerHTML = `<div class="alert alert-warn" style="margin-top:10px;">⚠️ 第 ${preYear} 年已不小于贷款总年限（${years} 年），贷款已正常结清，请将“第几年提前还”调小至 ${Math.max(1, years - 1)} 年以内。</div>`;
     return;
   }
   const paidOffTip = prepay >= remain ? '（已一次全额结清！）' : '';

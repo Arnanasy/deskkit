@@ -188,18 +188,28 @@ def pdf_to_images(path_str, fmt='png', dpi=150, pages_expr='', out_dir=None):
 def images_to_pdf(paths, out_dir=None):
     if not paths:
         raise ValueError('请至少选择 1 张图片')
+    import io
+    from tools_image import _open_oriented
+
     out_dir = Path(out_dir or OUTPUT_DIR)
     out_path = unique_path(out_dir, '图片合成文档', '.pdf')
     doc = pymupdf.open()
     try:
         for p in paths:
-            with Image.open(p) as raw:
-                img = ImageOps.exif_transpose(raw).convert('RGB')
+            with _open_oriented(p) as raw:
+                if raw.mode in ('RGBA', 'LA', 'P'):
+                    bg = Image.new('RGB', raw.size, (255, 255, 255))
+                    rgba = raw.convert('RGBA')
+                    bg.paste(rgba, mask=rgba.split()[-1])
+                    img = bg
+                elif raw.mode != 'RGB':
+                    img = raw.convert('RGB')
+                else:
+                    img = raw
                 w, h = img.size
                 # 按 A4 长边 842pt（297mm）等比缩放页面尺寸，避免高像素图生成数米巨型 PDF 页
                 scale = min(1.0, 842.0 / max(w, h)) if max(w, h) > 0 else 1.0
                 pw, ph = round(w * scale, 2), round(h * scale, 2)
-                import io
                 buf = io.BytesIO()
                 img.save(buf, format='JPEG', quality=92)
                 page = doc.new_page(width=pw, height=ph)

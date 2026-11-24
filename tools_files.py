@@ -329,70 +329,87 @@ def fix_zip_encoding(path_str, source_encoding='auto', out_dir=None):
     if not zipfile.is_zipfile(src):
         raise ValueError('该文件不是有效的 ZIP 压缩包')
 
+    if source_encoding == 'auto':
+        candidates = ['utf-8', 'gb18030', 'big5', 'shift_jis']
+    else:
+        import codecs
+        try:
+            codecs.lookup(source_encoding)
+        except LookupError:
+            raise ValueError(f'不支持的源编码: {source_encoding}')
+        candidates = [source_encoding]
+
     out_dir = Path(out_dir or OUTPUT_DIR)
     out_path = unique_path(out_dir, f'{clean_stem(src)}_修复中文', '.zip')
-
-    candidates = (
-        ['utf-8', 'gb18030', 'big5', 'shift_jis']
-        if source_encoding == 'auto'
-        else [source_encoding]
-    )
 
     fixed_count = 0
     total_count = 0
     preview_items = []
     seen_names = set()
 
-    with zipfile.ZipFile(src, 'r') as zin, zipfile.ZipFile(out_path, 'w', compression=zipfile.ZIP_DEFLATED) as zout:
-        for info in zin.infolist():
-            total_count += 1
-            orig_name = info.filename
-            new_name = orig_name
-            if not (info.flag_bits & 0x800):
-                try:
-                    raw_bytes = orig_name.encode('cp437')
-                except UnicodeEncodeError:
-                    raw_bytes = None
-                if raw_bytes is not None:
-                    for enc in candidates:
-                        try:
-                            decoded = raw_bytes.decode(enc)
-                            new_name = decoded
+    try:
+        with zipfile.ZipFile(src, 'r') as zin, zipfile.ZipFile(out_path, 'w', compression=zipfile.ZIP_DEFLATED) as zout:
+            for info in zin.infolist():
+                total_count += 1
+                orig_name = info.filename
+                new_name = orig_name
+                if not (info.flag_bits & 0x800):
+                    try:
+                        raw_bytes = orig_name.encode('cp437')
+                    except UnicodeEncodeError:
+                        raw_bytes = None
+                    if raw_bytes is not None:
+                        for enc in candidates:
+                            try:
+                                decoded = raw_bytes.decode(enc)
+                                new_name = decoded
+                                break
+                            except UnicodeDecodeError:
+                                continue
+
+                clean_name = _sanitize_zip_entry_name(new_name)
+                if not clean_name:
+                    continue
+                # 防止重名覆盖
+                if clean_name in seen_names:
+                    p_obj = Path(clean_name.rstrip('/'))
+                    suffix = '/' if clean_name.endswith('/') else p_obj.suffix
+                    stem = p_obj.name if clean_name.endswith('/') else p_obj.stem
+                    parent = str(p_obj.parent).replace('\\', '/')
+                    idx = 2
+                    while True:
+                        cand = f'{stem}_{idx}{suffix}'
+                        cand = f'{parent}/{cand}' if parent and parent != '.' else cand
+                        if cand not in seen_names:
+                            clean_name = cand
                             break
-                        except UnicodeDecodeError:
-                            continue
+                        idx += 1
+                seen_names.add(clean_name)
 
-            clean_name = _sanitize_zip_entry_name(new_name)
-            if not clean_name:
-                continue
-            # 防止重名覆盖
-            if clean_name in seen_names:
-                p_obj = Path(clean_name.rstrip('/'))
-                suffix = '/' if clean_name.endswith('/') else p_obj.suffix
-                stem = p_obj.name if clean_name.endswith('/') else p_obj.stem
-                parent = str(p_obj.parent).replace('\\', '/')
-                idx = 2
-                while True:
-                    cand = f'{stem}_{idx}{suffix}'
-                    cand = f'{parent}/{cand}' if parent and parent != '.' else cand
-                    if cand not in seen_names:
-                        clean_name = cand
-                        break
-                    idx += 1
-            seen_names.add(clean_name)
+                changed = (clean_name != orig_name)
+                if changed:
+                    fixed_count += 1
+                if len(preview_items) < 30:
+                    preview_items.append({'old': orig_name, 'new': clean_name, 'changed': changed})
 
-            changed = (clean_name != orig_name)
-            if changed:
-                fixed_count += 1
-            if len(preview_items) < 30:
-                preview_items.append({'old': orig_name, 'new': clean_name, 'changed': changed})
-
-            new_info = zipfile.ZipInfo(filename=clean_name, date_time=info.date_time)
-            new_info.external_attr = info.external_attr
-            if clean_name.endswith('/'):
-                zout.writestr(new_info, b'')
-            else:
-                zout.writestr(new_info, zin.read(info.filename), compress_type=zipfile.ZIP_DEFLATED)
+                dt = info.date_time
+                if not dt or len(dt) < 6 or dt[0] < 1980 or dt[1] < 1 or dt[2] < 1:
+                    dt = (1980, 1, 1, 0, 0, 0)
+                new_info = zipfile.ZipInfo(filename=clean_name, date_time=dt)
+                new_info.external_attr = info.external_attr
+                if clean_name.endswith('/'):
+                    zout.writestr(new_info, b'')
+                else:
+                    try:
+                        data = zin.read(info.filename)
+                    except RuntimeError as err:
+                        if 'encrypted' in str(err).lower():
+                            raise ValueError('该 ZIP 压缩包已加密，暂不支持直接修复加密压缩包')
+                        raise
+                    zout.writestr(new_info, data, compress_type=zipfile.ZIP_DEFLATED)
+    except Exception:
+        out_path.unlink(missing_ok=True)
+        raise
 
     return {
         'name': out_path.name,

@@ -291,6 +291,8 @@ class VideoTaskManager:
 
         options = options or {}
         infos = [probe_video(p) for p in paths]
+        if any(i['video_codec'] == '无' for i in infos):
+            raise ValueError('所选文件中包含无视频画面的文件，无法合并')
         total_dur = sum(i['duration'] or 0.0 for i in infos)
         total_size = sum(i['size_bytes'] or 0 for i in infos)
         out_dir = Path(options.get('output_dir') or OUTPUT_DIR)
@@ -615,18 +617,21 @@ def export_video_frames(path_str, mode='interval', interval=2.0, count=10,
         limit_args = ['-frames:v', str(n)]
     else:
         iv = max(0.2, float(interval or 2.0))
-        fps_val = 1.0 / iv
+        # 当间隔大于视频片段时长时，至少保证截取 1 帧，避免 fps 滤镜输出 0 帧导致 mjpeg 编码器报错
+        eff_iv = min(iv, span) if span > 0 else iv
+        fps_val = 1.0 / max(0.2, eff_iv)
         limit_args = ['-frames:v', str(max_frames)]
 
     pre = ['-ss', start_s] if start_s else []
     post = ['-t', f'{(end_sec - start_sec):.3f}'] if end_s else []
+    vf_chain = f'fps={fps_val:.6f},format=yuvj420p' if ext == '.jpg' else f'fps={fps_val:.6f}'
     q_args = ['-q:v', '2'] if ext == '.jpg' else []
 
     with tempfile.TemporaryDirectory(prefix='tb_frames_') as tmp:
         pattern = str(Path(tmp) / f'frame_%04d{ext}')
         cmd = [ffmpeg, '-y', '-hide_banner', '-loglevel', 'error'] + pre + [
             '-i', str(src),
-        ] + post + ['-vf', f'fps={fps_val:.6f}'] + q_args + limit_args + [pattern]
+        ] + post + ['-vf', vf_chain] + q_args + limit_args + [pattern]
         run = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8',
                              errors='replace', timeout=120, creationflags=_NO_WINDOW)
         if run.returncode != 0:
@@ -664,8 +669,18 @@ def export_video_frames(path_str, mode='interval', interval=2.0, count=10,
 # ==================== 字幕格式互转（SRT / VTT / ASS） ====================
 
 def _decode_text_bytes(raw_bytes):
-    """按常见中文与国际编码顺序自动解码文本字节。"""
-    for enc in ('utf-8-sig', 'utf-8', 'gb18030', 'utf-16', 'big5'):
+    """按 BOM 优先与常见中文/国际编码顺序自动解码文本字节。"""
+    if raw_bytes.startswith(b'\xef\xbb\xbf'):
+        try:
+            return raw_bytes.decode('utf-8-sig'), 'utf-8-sig'
+        except UnicodeDecodeError:
+            pass
+    if raw_bytes.startswith((b'\xff\xfe', b'\xfe\xff')):
+        try:
+            return raw_bytes.decode('utf-16'), 'utf-16'
+        except UnicodeDecodeError:
+            pass
+    for enc in ('utf-8', 'gb18030', 'utf-16', 'big5'):
         try:
             return raw_bytes.decode(enc), enc
         except UnicodeDecodeError:
@@ -708,7 +723,8 @@ def _ms_to_ass(ms):
 def _parse_srt_or_vtt(text):
     text = text.replace('\r\n', '\n').replace('\r', '\n')
     cues = []
-    blocks = re.split(r'\n{2,}', text.strip())
+    # 兼容空行中包含空格或制表符的 SRT/VTT 文件
+    blocks = re.split(r'\n[ \t]*\n+', text.strip())
     time_re = re.compile(
         r'(\d{1,2}:\d{2}(?::\d{2})?[.,]\d{1,3})\s*-->\s*(\d{1,2}:\d{2}(?::\d{2})?[.,]\d{1,3})'
     )
@@ -742,9 +758,10 @@ def _parse_ass(text):
     text = text.replace('\r\n', '\n').replace('\r', '\n')
     cues = []
     for ln in text.split('\n'):
-        if not ln.startswith('Dialogue:'):
+        stripped = ln.lstrip()
+        if not stripped.startswith('Dialogue:'):
             continue
-        body_part = ln.split(':', 1)[1].strip()
+        body_part = stripped.split(':', 1)[1].strip()
         # ASS Dialogue 固定前 9 个逗号字段，第 10 个字段起为正文（正文可能含逗号）
         fields = body_part.split(',', 9)
         if len(fields) < 10:
