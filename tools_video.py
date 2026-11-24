@@ -1,0 +1,425 @@
+"""视频工坊：ffprobe 编码检测、一键转 Win 通用 MP4（无损换壳/NVENC/x264）、压缩、裁剪、提音频、转 GIF。"""
+import json
+from pathlib import Path
+import shutil
+import subprocess
+import threading
+import time
+import uuid
+
+from tools_files import OUTPUT_DIR, clean_stem, unique_path
+
+_NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+_NVENC_CACHE = None
+
+
+def ffmpeg_bins():
+    return shutil.which('ffmpeg'), shutil.which('ffprobe')
+
+
+def has_nvenc():
+    """实测 NVIDIA h264_nvenc 在本机是否可真实编码（避免有驱动但版本不匹配时报错）。"""
+    global _NVENC_CACHE
+    if _NVENC_CACHE is not None:
+        return _NVENC_CACHE
+    ffmpeg, _ = ffmpeg_bins()
+    if not ffmpeg:
+        _NVENC_CACHE = False
+        return False
+    try:
+        run = subprocess.run(
+            [ffmpeg, '-hide_banner', '-loglevel', 'error',
+             '-f', 'lavfi', '-i', 'color=c=black:s=256x256:d=0.1',
+             '-c:v', 'h264_nvenc', '-f', 'null', '-'],
+            capture_output=True, timeout=6, creationflags=_NO_WINDOW,
+        )
+        _NVENC_CACHE = (run.returncode == 0)
+    except Exception:
+        _NVENC_CACHE = False
+    return _NVENC_CACHE
+
+
+def _parse_fps(rate_str):
+    if not rate_str or rate_str == '0/0':
+        return 0.0
+    if '/' in rate_str:
+        a, b = rate_str.split('/', 1)
+        try:
+            return round(float(a) / float(b), 2) if float(b) else 0.0
+        except ValueError:
+            return 0.0
+    try:
+        return round(float(rate_str), 2)
+    except ValueError:
+        return 0.0
+
+
+def probe_video(path_str):
+    """读取视频容器、编码、色彩位深、时长并给出 Windows 兼容性诊断。"""
+    _, ffprobe = ffmpeg_bins()
+    if not ffprobe:
+        raise RuntimeError('未找到 ffprobe，请确认已安装 FFmpeg')
+    path = Path(path_str)
+    if not path.exists():
+        raise FileNotFoundError(f'文件不存在: {path}')
+    run = subprocess.run(
+        [ffprobe, '-v', 'quiet', '-print_format', 'json', '-show_format', '-show_streams', str(path)],
+        capture_output=True, text=True, encoding='utf-8', timeout=15, creationflags=_NO_WINDOW,
+    )
+    if run.returncode != 0 or not run.stdout.strip():
+        raise RuntimeError('无法解析该媒体文件，可能已损坏或不是有效视频')
+    data = json.loads(run.stdout)
+    streams = data.get('streams', [])
+    fmt = data.get('format', {})
+
+    v = next((s for s in streams if s.get('codec_type') == 'video'), None)
+    a = next((s for s in streams if s.get('codec_type') == 'audio'), None)
+
+    v_codec = (v.get('codec_name') or '').lower() if v else ''
+    pix_fmt = (v.get('pix_fmt') or '').lower() if v else ''
+    a_codec = (a.get('codec_name') or '').lower() if a else ''
+    duration = float(fmt.get('duration') or (v.get('duration') if v else 0) or 0)
+    size_bytes = int(fmt.get('size') or path.stat().st_size)
+    ext = path.suffix.lower()
+
+    # 判断 Windows 自带播放器兼容性
+    issues = []
+    if v_codec and v_codec != 'h264':
+        issues.append(f'视频编码为 {v_codec.upper()}（Win 自带播放器常缺少解码器）')
+    if pix_fmt and pix_fmt not in ('yuv420p', 'yuvj420p', 'nv12'):
+        issues.append(f'色彩格式为 {pix_fmt}（非 8-bit 4:2:0，易黑屏或花屏）')
+    if a_codec and a_codec not in ('aac', 'mp3'):
+        issues.append(f'音频编码为 {a_codec.upper()}（建议转为 AAC）')
+    if ext not in ('.mp4', '.m4v'):
+        issues.append(f'封装格式为 {ext or "未知"}（建议封装为 MP4）')
+
+    can_remux_video = (v_codec == 'h264' and pix_fmt in ('yuv420p', 'yuvj420p', 'nv12', ''))
+    can_remux_audio = (not a_codec) or (a_codec in ('aac', 'mp3'))
+
+    if not issues:
+        advice = '当前视频已完全兼容 Windows 自带播放器，通常无需转码。'
+    elif can_remux_video:
+        advice = '视频流本身已是兼容 H.264，可走「无损秒换壳」，几秒完成且零画质损失！'
+    else:
+        advice = '需要重新编码为 H.264 (8-bit) + AAC；开启硬件加速可大幅提速。'
+
+    return {
+        'path': str(path),
+        'name': clean_stem(path) + path.suffix,
+        'size_bytes': size_bytes,
+        'duration': round(duration, 2),
+        'width': v.get('width', 0) if v else 0,
+        'height': v.get('height', 0) if v else 0,
+        'fps': _parse_fps(v.get('avg_frame_rate') or v.get('r_frame_rate')) if v else 0,
+        'video_codec': v_codec or '无',
+        'pix_fmt': pix_fmt or '未知',
+        'audio_codec': a_codec or '无音轨',
+        'compatible': len(issues) == 0,
+        'can_remux_video': can_remux_video,
+        'can_remux_audio': can_remux_audio,
+        'issues': issues,
+        'advice': advice,
+        'nvenc_available': has_nvenc(),
+    }
+
+
+def _parse_time_str(t):
+    """校验并返回合法时间字符串（如 00:01:20 或 80），空则返回 None。"""
+    if t is None:
+        return None
+    s = str(t).strip()
+    return s if s else None
+
+
+def _time_to_seconds(s):
+    if not s:
+        return 0.0
+    parts = s.split(':')
+    try:
+        vals = [float(p) for p in parts]
+    except ValueError:
+        return 0.0
+    if len(vals) == 1:
+        return vals[0]
+    if len(vals) == 2:
+        return vals[0] * 60 + vals[1]
+    if len(vals) == 3:
+        return vals[0] * 3600 + vals[1] * 60 + vals[2]
+    return 0.0
+
+
+class VideoTaskManager:
+    """后台执行 FFmpeg 转码任务，通过 -progress 管道提供实时百分比进度、取消与回收能力。"""
+
+    MAX_HISTORY = 50
+
+    def __init__(self):
+        self._tasks = {}
+        self._lock = threading.Lock()
+
+    def _prune_locked(self):
+        finished = [
+            (tid, t.get('started_at', 0))
+            for tid, t in self._tasks.items()
+            if t.get('status') != 'running'
+        ]
+        if len(finished) > self.MAX_HISTORY:
+            finished.sort(key=lambda x: x[1])
+            for tid, _ in finished[:len(finished) - self.MAX_HISTORY]:
+                self._tasks.pop(tid, None)
+
+    def get(self, task_id):
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if not task:
+                return None
+            return {k: v for k, v in task.items() if k != '_proc'}
+
+    def cancel(self, task_id):
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if not task:
+                return False
+            task['cancelled'] = True
+            proc = task.get('_proc')
+            if proc and proc.poll() is None:
+                try:
+                    proc.terminate()
+                except OSError:
+                    pass
+            return True
+
+    def cancel_all(self):
+        """退出服务时终止全部运行中的 FFmpeg 子进程，避免遗留孤儿进程。"""
+        with self._lock:
+            for task in self._tasks.values():
+                if task.get('status') == 'running':
+                    task['cancelled'] = True
+                    proc = task.get('_proc')
+                    if proc and proc.poll() is None:
+                        try:
+                            proc.terminate()
+                        except OSError:
+                            pass
+
+    def start(self, path_str, mode, options=None):
+        ffmpeg, _ = ffmpeg_bins()
+        if not ffmpeg:
+            raise RuntimeError('未找到 ffmpeg，请确认已安装 FFmpeg')
+        options = options or {}
+        info = probe_video(path_str)
+        src = Path(path_str)
+        out_dir = Path(options.get('output_dir') or OUTPUT_DIR)
+
+        cmd, out_path, mode_desc, est_duration = self._build_command(ffmpeg, src, info, mode, options, out_dir)
+        task_id = uuid.uuid4().hex[:12]
+        task = {
+            'id': task_id,
+            'status': 'running',
+            'progress': 0,
+            'speed': '',
+            'mode_desc': mode_desc,
+            'output_path': str(out_path),
+            'output_name': out_path.name,
+            'input_size': info['size_bytes'],
+            'output_size': 0,
+            'error': '',
+            'cancelled': False,
+            'started_at': time.time(),
+            '_proc': None,
+        }
+        with self._lock:
+            self._prune_locked()
+            self._tasks[task_id] = task
+
+        threading.Thread(
+            target=self._run_task,
+            args=(task_id, cmd, out_path, est_duration),
+            name=f'ffmpeg-{task_id}',
+            daemon=True,
+        ).start()
+        return self.get(task_id)
+
+    def _video_encoder_args(self, use_nvenc, quality, scale_height=0):
+        vf = []
+        if scale_height and int(scale_height) > 0:
+            # 保持宽高比且确保宽高均为偶数
+            vf.append(f'scale=-2:min(ih\\,{int(scale_height)})')
+        vf.append('format=yuv420p')
+        vf_args = ['-vf', ','.join(vf)]
+
+        if use_nvenc and has_nvenc():
+            cq_map = {'high': '21', 'balanced': '25', 'small': '30'}
+            cq = cq_map.get(quality, '25')
+            return vf_args + ['-c:v', 'h264_nvenc', '-preset', 'p5', '-rc', 'vbr', '-cq', cq, '-b:v', '0'], 'NVENC 显卡硬编'
+        crf_map = {'high': '19', 'balanced': '23', 'small': '28'}
+        crf = crf_map.get(quality, '23')
+        return vf_args + ['-c:v', 'libx264', '-preset', 'medium', '-crf', crf], 'x264 CPU 编码'
+
+    def _build_command(self, ffmpeg, src, info, mode, options, out_dir):
+        duration = info['duration'] or 0.0
+        use_nvenc = bool(options.get('use_nvenc', True))
+        quality = options.get('quality', 'balanced')
+        stem = clean_stem(src)
+
+        base = [ffmpeg, '-y', '-hide_banner', '-loglevel', 'error', '-progress', 'pipe:1', '-nostats']
+
+        if mode == 'compat':
+            out_path = unique_path(out_dir, f'{stem}_兼容', '.mp4')
+            force_reencode = bool(options.get('force_reencode', False))
+            if info['can_remux_video'] and not force_reencode:
+                a_args = ['-c:a', 'copy'] if info['can_remux_audio'] else ['-c:a', 'aac', '-b:a', '192k']
+                cmd = base + ['-i', str(src), '-map', '0:v:0', '-map', '0:a?', '-c:v', 'copy'] + a_args + [
+                    '-movflags', '+faststart', str(out_path)
+                ]
+                return cmd, out_path, '智能无损换壳 → 通用 MP4', duration
+            v_args, enc_name = self._video_encoder_args(use_nvenc, quality)
+            cmd = base + ['-i', str(src), '-map', '0:v:0', '-map', '0:a?'] + v_args + [
+                '-c:a', 'aac', '-b:a', '192k', '-movflags', '+faststart', str(out_path)
+            ]
+            return cmd, out_path, f'{enc_name} → Win 通用 MP4', duration
+
+        if mode == 'compress':
+            scale_h = int(options.get('max_height') or 0)
+            suffix = f'_压缩{scale_h}p' if scale_h else '_压缩'
+            out_path = unique_path(out_dir, f'{stem}{suffix}', '.mp4')
+            v_args, enc_name = self._video_encoder_args(use_nvenc, quality or 'small', scale_h)
+            cmd = base + ['-i', str(src), '-map', '0:v:0', '-map', '0:a?'] + v_args + [
+                '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart', str(out_path)
+            ]
+            return cmd, out_path, f'{enc_name} 压缩体积', duration
+
+        if mode == 'trim':
+            start_s = _parse_time_str(options.get('start'))
+            end_s = _parse_time_str(options.get('end'))
+            start_sec = _time_to_seconds(start_s)
+            end_sec = _time_to_seconds(end_s) if end_s else 0.0
+            if end_s and end_sec <= start_sec:
+                raise ValueError('结束时间必须大于开始时间')
+            lossless = bool(options.get('lossless', False))
+            out_path = unique_path(out_dir, f'{stem}_裁剪', '.mp4')
+            pre = ['-ss', start_s] if start_s else []
+            # -ss 置于 -i 之前时会重置时间轴为 0，因此用 -t 指定截取时长而非 -to
+            if end_s:
+                clip_dur = end_sec - start_sec
+                post = ['-t', f'{clip_dur:.3f}']
+                est = max(0.5, clip_dur)
+            else:
+                post = []
+                est = max(0.5, duration - start_sec)
+            if lossless and info['can_remux_video']:
+                cmd = base + pre + ['-i', str(src)] + post + [
+                    '-c', 'copy', '-movflags', '+faststart', str(out_path)
+                ]
+                return cmd, out_path, '无损快速裁剪', est
+            v_args, enc_name = self._video_encoder_args(use_nvenc, 'high')
+            cmd = base + pre + ['-i', str(src)] + post + v_args + [
+                '-c:a', 'aac', '-b:a', '192k', '-movflags', '+faststart', str(out_path)
+            ]
+            return cmd, out_path, f'精确裁剪（{enc_name}）', est
+
+        if mode == 'audio':
+            if info['audio_codec'] == '无音轨':
+                raise ValueError('该视频不包含音轨，无法提取音频')
+            afmt = (options.get('audio_format') or 'mp3').lower()
+            if afmt not in ('mp3', 'm4a', 'wav'):
+                afmt = 'mp3'
+            out_path = unique_path(out_dir, f'{stem}_音频', f'.{afmt}')
+            if afmt == 'mp3':
+                a_args = ['-vn', '-c:a', 'libmp3lame', '-b:a', '192k']
+            elif afmt == 'm4a':
+                a_args = ['-vn', '-c:a', 'aac', '-b:a', '192k']
+            else:
+                a_args = ['-vn', '-c:a', 'pcm_s16le']
+            cmd = base + ['-i', str(src)] + a_args + [str(out_path)]
+            return cmd, out_path, f'提取音频 ({afmt.upper()})', duration
+
+        if mode == 'gif':
+            start_s = _parse_time_str(options.get('start'))
+            end_s = _parse_time_str(options.get('end'))
+            start_sec = _time_to_seconds(start_s)
+            end_sec = _time_to_seconds(end_s) if end_s else 0.0
+            if end_s and end_sec <= start_sec:
+                raise ValueError('结束时间必须大于开始时间')
+            fps = max(5, min(24, int(options.get('fps') or 12)))
+            width = max(160, min(960, int(options.get('width') or 480)))
+            out_path = unique_path(out_dir, f'{stem}_动图', '.gif')
+            pre = ['-ss', start_s] if start_s else []
+            if end_s:
+                clip_dur = end_sec - start_sec
+                post = ['-t', f'{clip_dur:.3f}']
+                est = max(0.5, clip_dur)
+            else:
+                post = []
+                est = max(0.5, min(duration - start_sec, 30.0))
+            vf = (
+                f'fps={fps},scale={width}:-1:flags=lanczos,'
+                'split[s0][s1];[s0]palettegen=stats_mode=diff[p];[s1][p]paletteuse=dither=bayer'
+            )
+            cmd = base + pre + ['-i', str(src)] + post + ['-vf', vf, '-loop', '0', str(out_path)]
+            return cmd, out_path, f'生成高清 GIF ({width}px / {fps}fps)', est
+
+        raise ValueError(f'不支持的视频处理模式: {mode}')
+
+    def _run_task(self, task_id, cmd, out_path, est_duration):
+        stderr_lines = []
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                creationflags=_NO_WINDOW,
+            )
+            with self._lock:
+                self._tasks[task_id]['_proc'] = proc
+
+            def read_err():
+                for line in proc.stderr:
+                    stderr_lines.append(line.strip())
+
+            err_thread = threading.Thread(target=read_err, daemon=True)
+            err_thread.start()
+
+            for line in proc.stdout:
+                line = line.strip()
+                if '=' not in line:
+                    continue
+                k, v = line.split('=', 1)
+                if k == 'out_time_us' and est_duration > 0:
+                    try:
+                        pct = min(99, max(0, int(int(v) / (est_duration * 1_000_000) * 100)))
+                        with self._lock:
+                            self._tasks[task_id]['progress'] = pct
+                    except ValueError:
+                        pass
+                elif k == 'speed':
+                    with self._lock:
+                        self._tasks[task_id]['speed'] = v.strip()
+
+            proc.wait()
+            err_thread.join(timeout=2)
+
+            with self._lock:
+                task = self._tasks[task_id]
+                if task['cancelled']:
+                    task['status'] = 'cancelled'
+                    out_path.unlink(missing_ok=True)
+                elif proc.returncode == 0 and out_path.exists():
+                    task['status'] = 'done'
+                    task['progress'] = 100
+                    task['output_size'] = out_path.stat().st_size
+                    task['elapsed'] = round(time.time() - task['started_at'], 1)
+                else:
+                    task['status'] = 'error'
+                    task['error'] = ' | '.join(stderr_lines[-3:]) or f'FFmpeg 返回错误码 {proc.returncode}'
+                    out_path.unlink(missing_ok=True)
+        except Exception as err:
+            with self._lock:
+                self._tasks[task_id]['status'] = 'error'
+                self._tasks[task_id]['error'] = str(err)
+
+
+video_tasks = VideoTaskManager()
