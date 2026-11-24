@@ -49,6 +49,17 @@ function toast(msg) {
   toast._t = setTimeout(() => el.classList.remove('show'), 2600);
 }
 
+function copyText(text, okMsg = '已复制到剪贴板') {
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(
+      () => toast(okMsg),
+      () => toast('剪贴板写入被浏览器阻止，请手动选中复制'),
+    );
+  } else {
+    toast('当前浏览器不支持自动复制，请手动选中复制');
+  }
+}
+
 function fmtBytes(n) {
   if (!n && n !== 0) return '—';
   const units = ['B', 'KB', 'MB', 'GB'];
@@ -968,7 +979,7 @@ $$('[data-tact]').forEach((b) => {
     else if (act === 'noblank') el.value = lines.filter((l) => l.trim() !== '').join('\n');
     else if (act === 'sort') el.value = lines.sort((a, b2) => a.localeCompare(b2, 'zh-CN')).join('\n');
     else if (act === 'clear') el.value = '';
-    else if (act === 'copy') { navigator.clipboard.writeText(el.value); toast('已复制到剪贴板'); }
+    else if (act === 'copy') copyText(el.value, '已复制到剪贴板');
     updateTextStats();
   };
 });
@@ -985,7 +996,7 @@ $('#btn-json-min').onclick = () => {
     $('#tj-msg').innerHTML = '<div class="alert alert-ok">已压缩为单行</div>';
   } catch (e) { $('#tj-msg').innerHTML = `<div class="alert alert-err">语法错误：${escHtml(e.message)}</div>`; }
 };
-$('#btn-json-copy').onclick = () => { navigator.clipboard.writeText($('#tj-input').value); toast('已复制 JSON'); };
+$('#btn-json-copy').onclick = () => copyText($('#tj-input').value, '已复制 JSON');
 
 function genQR() {
   const txt = $('#qr-text').value.trim() || '本地工具箱 · 离线二维码';
@@ -1022,10 +1033,7 @@ function genPasswords() {
       <button class="btn btn-sm" data-idx="${idx}">复制</button>
     </div>`).join('');
   $('#pw-list').querySelectorAll('button').forEach((btn) => {
-    btn.onclick = () => {
-      navigator.clipboard.writeText(list[Number(btn.dataset.idx)]);
-      toast('已复制密码');
-    };
+    btn.onclick = () => copyText(list[Number(btn.dataset.idx)], '已复制密码');
   });
 }
 $('#btn-pw-gen').onclick = genPasswords;
@@ -1101,27 +1109,34 @@ $('#btn-ts-now').onclick = () => {
 };
 $('#btn-ts-copy-sec').onclick = () => {
   if (!state.tsLastSec) return toast('请先输入有效日期时间');
-  navigator.clipboard.writeText(state.tsLastSec);
-  toast('已复制秒级时间戳');
+  copyText(state.tsLastSec, '已复制秒级时间戳');
 };
 $('#btn-ts-copy-ms').onclick = () => {
   if (!state.tsLastMs) return toast('请先输入有效日期时间');
-  navigator.clipboard.writeText(state.tsLastMs);
-  toast('已复制毫秒级时间戳');
+  copyText(state.tsLastMs, '已复制毫秒级时间戳');
 };
 $('#btn-ts-now').click();
 
+let _rxTimer = null;
 function updateRegex() {
   const pat = $('#rx-pat').value;
   const txt = $('#rx-text').value;
   if (!pat) { $('#rx-out').textContent = '请输入正则表达式'; return; }
+  if (pat.length > 500 || txt.length > 50000) {
+    $('#rx-out').textContent = '正则或测试文本过长（上限 500 / 50000 字符），请精简后测试';
+    return;
+  }
   try {
     const matches = [...txt.matchAll(new RegExp(pat, 'g'))].map((m) => m[0]);
     $('#rx-out').textContent = matches.length ? `匹配到 ${matches.length} 处：${matches.slice(0, 20).join(' | ')}` : '无匹配结果';
   } catch (e) { $('#rx-out').textContent = `正则有误：${e.message}`; }
 }
-$('#rx-pat').oninput = updateRegex;
-$('#rx-text').oninput = updateRegex;
+function scheduleRegex() {
+  clearTimeout(_rxTimer);
+  _rxTimer = setTimeout(updateRegex, 180);
+}
+$('#rx-pat').oninput = scheduleRegex;
+$('#rx-text').oninput = scheduleRegex;
 
 $('#btn-rn-folder').onclick = async () => {
   const res = await api('/api/pick-folder', { title: '选择要批量重命名的文件夹' });
@@ -1305,7 +1320,7 @@ async function runFileHash(path) {
         <button class="btn btn-sm js-copy-hash" data-val="${escHtml(v)}">复制</button>
       </div>`).join('');
     $('#hash-values').querySelectorAll('.js-copy-hash').forEach((btn) => {
-      btn.onclick = () => { navigator.clipboard.writeText(btn.dataset.val); toast('已复制哈希值'); };
+      btn.onclick = () => copyText(btn.dataset.val, '已复制哈希值');
     });
     updateHashCompare();
   } catch (e) { toast(e.message); }
@@ -1497,7 +1512,8 @@ function calcCompound() {
   const init = Number($('#cp-init').value) || 0;
   const mon = Number($('#cp-month').value) || 0;
   const rate = (Number($('#cp-rate').value) || 0) / 100 / 12;
-  const months = Math.max(1, (Number($('#cp-years').value) || 10) * 12);
+  const years = Math.max(1, Math.min(100, Number($('#cp-years').value) || 10));
+  const months = Math.round(years * 12);
   let total = init;
   for (let i = 0; i < months; i++) total = total * (1 + rate) + mon;
   const principal = init + mon * months;
@@ -1519,11 +1535,15 @@ function calcDate() {
   const d2 = parseLocalDate($('#dt-end').value);
   if (!d1 || !d2) return;
   const diffDays = Math.round((d2 - d1) / 86400000);
-  let workdays = 0;
+  // O(1) 公式计算不含周末的工作日（整周×5 + 余数 0~6 天），跨度几千年也能瞬间算出
+  const absDays = Math.abs(diffDays);
+  const fullWeeks = Math.floor(absDays / 7);
+  const remDays = absDays % 7;
+  let workdays = fullWeeks * 5;
   const step = diffDays >= 0 ? 1 : -1;
-  for (let i = 0; i !== diffDays; i += step) {
-    const cur = new Date(d1.getFullYear(), d1.getMonth(), d1.getDate() + i);
-    const wd = cur.getDay();
+  const startDow = d1.getDay();
+  for (let i = 0; i < remDays; i++) {
+    const wd = ((startDow + i * step) % 7 + 7) % 7;
     if (wd !== 0 && wd !== 6) workdays++;
   }
   $('#dt-out').innerHTML = `

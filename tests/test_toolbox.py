@@ -109,6 +109,14 @@ class TestToolsFiles(unittest.TestCase):
             res_up = tools_files.preview_batch_rename(tmp, ext_case='upper')
             self.assertEqual(res_up['items'][0]['new_name'], 'Photo.JPG')
 
+    def test_preview_batch_rename_detects_conflict_with_unselected_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / 'pic.jpg').write_text('a', encoding='utf-8')
+            (Path(tmp) / 'pic.png').write_text('b', encoding='utf-8')
+            res = tools_files.preview_batch_rename(tmp, ext_filter='.jpg', new_ext='.png')
+            self.assertEqual(res['conflicts'], 1)
+            self.assertTrue(res['items'][0]['conflict'])
+
     def test_fix_zip_encoding_restores_gbk_chinese_and_sanitizes_zip_slip(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp) / '中文目录'
@@ -260,6 +268,14 @@ class TestToolsImage(unittest.TestCase):
             with self.assertRaises(ValueError):
                 tools_image.split_image(str(src), mode='vertical', max_piece_height=200, out_dir=base)
 
+    def test_stitch_canvas_validation(self):
+        with self.assertRaises(ValueError):
+            tools_image._validate_canvas_size(100, 70000, 'jpg')
+        with self.assertRaises(ValueError):
+            tools_image._validate_canvas_size(20000, 20000, 'png')
+        with self.assertRaises(ValueError):
+            tools_image._validate_canvas_size(100, 100, 'exe')
+
 
 class TestToolsPdf(unittest.TestCase):
     """PDF 页码解析表达式边界与 AES-256 加密/解锁。"""
@@ -269,6 +285,10 @@ class TestToolsPdf(unittest.TestCase):
         self.assertEqual(tools_pdf.parse_pages('1-3，5, 2, 10-12', 6), [0, 1, 2, 4])
         # 支持倒序区间
         self.assertEqual(tools_pdf.parse_pages('4-2', 5), [3, 2, 1])
+        # 非法字符应给出友好中文报错
+        with self.assertRaises(ValueError) as ctx:
+            tools_pdf.parse_pages('1-a', 5)
+        self.assertIn('页码', str(ctx.exception))
 
     def test_protect_and_unlock_pdf(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -291,6 +311,21 @@ class TestToolsPdf(unittest.TestCase):
             info = tools_pdf.pdf_info(enc_path)
             self.assertTrue(info['needs_pass'])
             self.assertTrue(info['is_encrypted'])
+
+            # 加密 PDF 送入合并/编辑/压缩应给出友好中文提示
+            with self.assertRaises(ValueError) as ctx:
+                tools_pdf.merge_pdfs([str(src), enc_path], out_dir=base)
+            self.assertIn('解锁', str(ctx.exception))
+            with self.assertRaises(ValueError) as ctx2:
+                tools_pdf.edit_pages(enc_path, action='rotate', pages_expr='1', out_dir=base)
+            self.assertIn('解锁', str(ctx2.exception))
+            with self.assertRaises(ValueError) as ctx3:
+                tools_pdf.compress_pdf(enc_path, out_dir=base)
+            self.assertIn('解锁', str(ctx3.exception))
+
+            # 旋转页码无有效匹配时应报错
+            with self.assertRaises(ValueError):
+                tools_pdf.edit_pages(str(src), action='rotate', pages_expr='99', out_dir=base)
 
             # 错误密码解锁失败
             with self.assertRaises(ValueError):

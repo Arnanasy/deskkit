@@ -163,10 +163,26 @@ def process_convert_compress(paths, target_fmt='keep', quality=82, max_width=0, 
     }
 
 
+def _validate_canvas_size(width, height, fmt):
+    """提前拦截超大拼接画布与 JPG 单边 65500px 上限，避免内存爆涨或保存失败。"""
+    fmt_l = (fmt or 'png').lower().lstrip('.')
+    if fmt_l not in ('png', 'jpg', 'jpeg', 'webp', 'avif'):
+        raise ValueError(f'不支持的输出图片格式: {fmt}')
+    if width <= 0 or height <= 0:
+        raise ValueError('目标画布尺寸无效')
+    if fmt_l in ('jpg', 'jpeg') and (width > 65000 or height > 65000):
+        raise ValueError(f'拼接尺寸 {width}×{height} 超出 JPG 单边 65000px 上限，请改选 PNG 或先压缩图片')
+    if width * height > 300_000_000:
+        raise ValueError(f'拼接总像素过大（{width}×{height}），请先批量缩小尺寸或减少拼接张数')
+
+
 def stitch_images(paths, mode='vertical', gap=0, bg_color='#ffffff', cols=2, out_fmt='png', out_dir=None):
     """拼长图（竖向/横向）或拼宫格。"""
     if len(paths) < 2:
         raise ValueError('请至少选择 2 张图片进行拼接')
+    fmt_clean = (out_fmt or 'png').lower().lstrip('.')
+    if fmt_clean not in ('png', 'jpg', 'jpeg', 'webp', 'avif'):
+        raise ValueError(f'不支持的输出图片格式: {out_fmt}')
     out_dir = Path(out_dir or OUTPUT_DIR)
     gap = max(0, min(100, int(gap or 0)))
     cols = max(2, min(6, int(cols or 2)))
@@ -181,6 +197,7 @@ def stitch_images(paths, mode='vertical', gap=0, bg_color='#ffffff', cols=2, out
                 for im in imgs
             ]
             total_h = sum(im.height for im in resized) + gap * (len(resized) - 1)
+            _validate_canvas_size(target_w, total_h, fmt_clean)
             canvas = Image.new('RGBA', (target_w, total_h), bg_color)
             y = 0
             for im in resized:
@@ -194,6 +211,7 @@ def stitch_images(paths, mode='vertical', gap=0, bg_color='#ffffff', cols=2, out
                 for im in imgs
             ]
             total_w = sum(im.width for im in resized) + gap * (len(resized) - 1)
+            _validate_canvas_size(total_w, target_h, fmt_clean)
             canvas = Image.new('RGBA', (total_w, target_h), bg_color)
             x = 0
             for im in resized:
@@ -206,13 +224,14 @@ def stitch_images(paths, mode='vertical', gap=0, bg_color='#ffffff', cols=2, out
             rows = math.ceil(len(imgs) / cols)
             total_w = cols * cell_w + gap * (cols - 1)
             total_h = rows * cell_h + gap * (rows - 1)
+            _validate_canvas_size(total_w, total_h, fmt_clean)
             canvas = Image.new('RGBA', (total_w, total_h), bg_color)
             for idx, im in enumerate(imgs):
                 fitted = ImageOps.fit(im, (cell_w, cell_h), Image.Resampling.LANCZOS)
                 r, c = divmod(idx, cols)
                 canvas.paste(fitted, (c * (cell_w + gap), r * (cell_h + gap)), fitted)
 
-        ext = '.' + (out_fmt.lower().lstrip('.') or 'png')
+        ext = '.' + fmt_clean
         out_path = unique_path(out_dir, '拼接图片', ext)
         _save_image(canvas, out_path, ext.lstrip('.'), quality=90)
         return {

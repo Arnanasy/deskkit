@@ -172,7 +172,9 @@ class ToolboxHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header('Content-Type', ctype)
         self.send_header('X-Content-Type-Options', 'nosniff')
-        self.send_header('Content-Security-Policy', 'sandbox')
+        # Chrome/Edge 内置 PDF 查看器在 iframe 收到 CSP: sandbox 时易白屏，仅对非 PDF 预览加 sandbox
+        if target.suffix.lower() != '.pdf':
+            self.send_header('Content-Security-Policy', 'sandbox')
         self.send_header('Accept-Ranges', 'bytes')
         self.send_header('Content-Length', str(length))
         if status == 206 and size > 0:
@@ -212,7 +214,7 @@ class ToolboxHandler(BaseHTTPRequestHandler):
         try:
             run = subprocess.run(
                 [ffmpeg, '-hide_banner', '-loglevel', 'error', '-ss', '00:00:01', '-i', str(target),
-                 '-frames:v', '1', '-vf', 'scale=480:-2', '-f', 'image2pipe', '-vcodec', 'mjpeg', 'pipe:1'],
+                 '-frames:v', '1', '-vf', 'scale=480:-2,format=yuvj420p', '-f', 'image2pipe', '-vcodec', 'mjpeg', 'pipe:1'],
                 capture_output=True, timeout=8, creationflags=no_win,
             )
             data = run.stdout
@@ -220,7 +222,7 @@ class ToolboxHandler(BaseHTTPRequestHandler):
                 # 短视频不足 1 秒时回退取第 0 秒首帧
                 run = subprocess.run(
                     [ffmpeg, '-hide_banner', '-loglevel', 'error', '-i', str(target),
-                     '-frames:v', '1', '-vf', 'scale=480:-2', '-f', 'image2pipe', '-vcodec', 'mjpeg', 'pipe:1'],
+                     '-frames:v', '1', '-vf', 'scale=480:-2,format=yuvj420p', '-f', 'image2pipe', '-vcodec', 'mjpeg', 'pipe:1'],
                     capture_output=True, timeout=8, creationflags=no_win,
                 )
                 data = run.stdout
@@ -381,7 +383,9 @@ class ToolboxHandler(BaseHTTPRequestHandler):
                 return
 
             if path == '/api/video/start':
-                task = video_tasks.start(data['path'], data['mode'], data.get('options') or {})
+                opts = dict(data.get('options') or {})
+                opts.pop('output_dir', None)  # 禁止通过 HTTP 参数指定任意输出目录
+                task = video_tasks.start(data['path'], data['mode'], opts)
                 self._send_json(task)
                 return
 
@@ -391,7 +395,9 @@ class ToolboxHandler(BaseHTTPRequestHandler):
                 return
 
             if path == '/api/video/merge':
-                task = video_tasks.start_merge(data.get('paths', []), data.get('options') or {})
+                opts = dict(data.get('options') or {})
+                opts.pop('output_dir', None)  # 禁止通过 HTTP 参数指定任意输出目录
+                task = video_tasks.start_merge(data.get('paths', []), opts)
                 self._send_json(task)
                 return
 

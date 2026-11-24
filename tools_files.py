@@ -183,9 +183,14 @@ def preview_batch_rename(folder, find_text='', replace_text='', prefix='', suffi
         for e in ext_filter.split(',') if e.strip()
     } if ext_filter.strip() else set()
 
-    files = sorted([p for p in base.iterdir() if p.is_file()], key=lambda p: p.name.lower())
+    all_files = sorted([p for p in base.iterdir() if p.is_file()], key=lambda p: p.name.lower())
     if allowed_exts:
-        files = [p for p in files if p.suffix.lower() in allowed_exts]
+        files = [p for p in all_files if p.suffix.lower() in allowed_exts]
+        selected_lower = {p.name.lower() for p in files}
+        existing_unselected = {p.name.lower() for p in all_files if p.name.lower() not in selected_lower}
+    else:
+        files = all_files
+        existing_unselected = set()
 
     regex = None
     if find_text and use_regex:
@@ -221,7 +226,7 @@ def preview_batch_rename(folder, find_text='', replace_text='', prefix='', suffi
         new_name = safe_filename(stem) + ext
         changed = new_name != f.name
         key = new_name.lower()
-        conflict = key in seen_lower
+        conflict = (key in seen_lower) or (key in existing_unselected)
         seen_lower.add(key)
         if conflict:
             conflict_count += 1
@@ -346,11 +351,16 @@ def fix_zip_encoding(path_str, source_encoding='auto', out_dir=None):
     total_count = 0
     preview_items = []
     seen_names = set()
+    max_entry_bytes = 256 * 1024 * 1024     # 单文件解压上限 256MB，防内存撑爆
+    max_total_bytes = 2 * 1024 * 1024 * 1024  # 累计解压上限 2GB，防御 ZIP 炸弹
+    total_unpacked = 0
 
     try:
         with zipfile.ZipFile(src, 'r') as zin, zipfile.ZipFile(out_path, 'w', compression=zipfile.ZIP_DEFLATED) as zout:
             for info in zin.infolist():
                 total_count += 1
+                if not info.is_dir() and info.file_size > max_entry_bytes:
+                    raise ValueError(f'压缩包内单个文件过大（超过 256MB）：{info.filename}')
                 orig_name = info.filename
                 new_name = orig_name
                 if not (info.flag_bits & 0x800):
@@ -397,16 +407,28 @@ def fix_zip_encoding(path_str, source_encoding='auto', out_dir=None):
                     dt = (1980, 1, 1, 0, 0, 0)
                 new_info = zipfile.ZipInfo(filename=clean_name, date_time=dt)
                 new_info.external_attr = info.external_attr
+                new_info.compress_type = zipfile.ZIP_DEFLATED
                 if clean_name.endswith('/'):
                     zout.writestr(new_info, b'')
                 else:
                     try:
-                        data = zin.read(info.filename)
+                        with zin.open(info, 'r') as src_stream, zout.open(new_info, 'w') as dst_stream:
+                            entry_read = 0
+                            while True:
+                                chunk = src_stream.read(1024 * 1024)
+                                if not chunk:
+                                    break
+                                entry_read += len(chunk)
+                                total_unpacked += len(chunk)
+                                if entry_read > max_entry_bytes:
+                                    raise ValueError(f'压缩包内单文件解压体积超过 256MB 上限：{clean_name}')
+                                if total_unpacked > max_total_bytes:
+                                    raise ValueError('压缩包累计解压体积超过 2GB 上限，已中止以防内存/磁盘耗尽')
+                                dst_stream.write(chunk)
                     except RuntimeError as err:
                         if 'encrypted' in str(err).lower():
                             raise ValueError('该 ZIP 压缩包已加密，暂不支持直接修复加密压缩包')
                         raise
-                    zout.writestr(new_info, data, compress_type=zipfile.ZIP_DEFLATED)
     except Exception:
         out_path.unlink(missing_ok=True)
         raise

@@ -16,6 +16,13 @@ def _clean_stem(path):
     return clean_stem(path)
 
 
+def _ensure_unlocked(doc, name=''):
+    """检测加密 PDF 并给出统一友好的中文提示，避免抛出底层英文异常。"""
+    if doc.needs_pass:
+        prefix = f'「{name}」' if name else '该 PDF '
+        raise ValueError(f'{prefix}已设置打开密码，请先在「加密 / 解锁」中解锁后再处理')
+
+
 def parse_pages(expr, total_pages):
     """解析如 '1-3, 5, 8-10' 的 1-based 页码表达式，返回去重保序的 0-based 页码列表。"""
     if not expr or not expr.strip():
@@ -28,7 +35,10 @@ def parse_pages(expr, total_pages):
             continue
         if '-' in part:
             a, b = part.split('-', 1)
-            raw_start, raw_end = int(a.strip()), int(b.strip())
+            try:
+                raw_start, raw_end = int(a.strip()), int(b.strip())
+            except ValueError:
+                raise ValueError(f'页码范围格式有误: "{part}"（示例：1-3, 5）')
             if raw_start <= raw_end:
                 if raw_end < 1 or raw_start > total_pages:
                     continue
@@ -43,7 +53,10 @@ def parse_pages(expr, total_pages):
                     seen.add(idx)
                     result.append(idx)
         else:
-            idx = int(part) - 1
+            try:
+                idx = int(part) - 1
+            except ValueError:
+                raise ValueError(f'页码格式有误: "{part}"（请输入数字或区间，如 1-3, 5）')
             if 0 <= idx < total_pages and idx not in seen:
                 seen.add(idx)
                 result.append(idx)
@@ -78,6 +91,7 @@ def merge_pdfs(paths, out_dir=None):
     try:
         for p in paths:
             with pymupdf.open(p) as src:
+                _ensure_unlocked(src, Path(p).name)
                 merged.insert_pdf(src)
         merged.save(out_path, garbage=3, deflate=True)
         pages = len(merged)
@@ -97,6 +111,7 @@ def edit_pages(path_str, action, pages_expr='', angle=90, out_dir=None):
     out_dir = Path(out_dir or OUTPUT_DIR)
     stem = _clean_stem(path_str)
     with pymupdf.open(path_str) as doc:
+        _ensure_unlocked(doc)
         total = len(doc)
         selected = parse_pages(pages_expr, total)
 
@@ -127,6 +142,8 @@ def edit_pages(path_str, action, pages_expr='', angle=90, out_dir=None):
                     'output_size': out_path.stat().st_size, 'output_dir': str(out_dir)}
 
         if action == 'rotate':
+            if not selected:
+                raise ValueError('未匹配到任何有效页码')
             angle = int(angle or 90) % 360
             for idx in selected:
                 page = doc[idx]
@@ -137,6 +154,8 @@ def edit_pages(path_str, action, pages_expr='', angle=90, out_dir=None):
                     'output_size': out_path.stat().st_size, 'output_dir': str(out_dir)}
 
         if action == 'split_all':
+            if not selected:
+                raise ValueError('未匹配到任何有效页码')
             out_paths = []
             for idx in selected:
                 p = unique_path(out_dir, f'{stem}_第{idx + 1}页', '.pdf')
@@ -163,6 +182,7 @@ def pdf_to_images(path_str, fmt='png', dpi=150, pages_expr='', out_dir=None):
 
     out_paths = []
     with pymupdf.open(path_str) as doc:
+        _ensure_unlocked(doc)
         selected = parse_pages(pages_expr, len(doc))
         if not selected:
             raise ValueError('未匹配到任何有效页码')
@@ -230,6 +250,7 @@ def compress_pdf(path_str, level='balanced', out_dir=None):
     out_path = unique_path(out_dir, f'{_clean_stem(src)}_压缩', '.pdf')
 
     with pymupdf.open(src) as doc:
+        _ensure_unlocked(doc)
         if level in ('balanced', 'strong'):
             dpi = 144 if level == 'balanced' else 108
             qual = 75 if level == 'balanced' else 58
@@ -315,6 +336,7 @@ def pdf_to_word(path_str, out_dir=None):
     # 快速检测是否包含文字层（仅检查前 5 页）
     has_text = False
     with pymupdf.open(src) as doc:
+        _ensure_unlocked(doc)
         pages = len(doc)
         for i in range(min(pages, 5)):
             if doc[i].get_text('text').strip():
