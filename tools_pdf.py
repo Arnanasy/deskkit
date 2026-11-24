@@ -53,14 +53,19 @@ def parse_pages(expr, total_pages):
 def pdf_info(path_str):
     path = Path(path_str)
     with pymupdf.open(path) as doc:
-        w = round(doc[0].rect.width) if len(doc) else 0
-        h = round(doc[0].rect.height) if len(doc) else 0
+        needs_pass = bool(doc.needs_pass)
+        is_encrypted = bool(doc.is_encrypted)
+        pages = 0 if needs_pass else len(doc)
+        w = round(doc[0].rect.width) if pages else 0
+        h = round(doc[0].rect.height) if pages else 0
         return {
             'name': _clean_stem(path) + path.suffix,
             'path': str(path),
-            'pages': len(doc),
+            'pages': pages,
             'size_bytes': path.stat().st_size,
-            'page_size': f'{w} × {h} pt',
+            'page_size': f'{w} × {h} pt' if pages else '需密码查看',
+            'needs_pass': needs_pass,
+            'is_encrypted': is_encrypted,
         }
 
 
@@ -332,6 +337,77 @@ def word_to_pdf(path_str, out_dir=None):
     _word_convert(src, out_path, 17)  # 17 = wdExportFormatPDF
     with pymupdf.open(out_path) as doc:
         pages = len(doc)
+    return {
+        'name': out_path.name,
+        'path': str(out_path),
+        'pages': pages,
+        'output_size': out_path.stat().st_size,
+        'output_dir': str(out_dir),
+    }
+
+
+def protect_pdf(path_str, user_pw='', owner_pw='', allow_print=True, allow_copy=True, out_dir=None):
+    """使用 AES-256 为 PDF 设置打开密码或打印/复制权限限制。"""
+    user_pw = (user_pw or '').strip()
+    owner_pw = (owner_pw or '').strip()
+    if not user_pw and not owner_pw:
+        raise ValueError('请至少填写“打开密码”或“权限密码”之一')
+    out_dir = Path(out_dir or OUTPUT_DIR)
+    src = Path(path_str)
+    if not src.exists():
+        raise FileNotFoundError('PDF 文件不存在')
+
+    perms = int(pymupdf.PDF_PERM_ACCESSIBILITY)
+    if allow_print:
+        perms |= int(pymupdf.PDF_PERM_PRINT)
+    if allow_copy:
+        perms |= int(pymupdf.PDF_PERM_COPY)
+
+    out_path = unique_path(out_dir, f'{_clean_stem(src)}_加密', '.pdf')
+    with pymupdf.open(src) as doc:
+        if doc.needs_pass:
+            raise ValueError('原 PDF 已有打开密码，请先使用“解除密码”功能解锁')
+        pages = len(doc)
+        doc.save(
+            out_path,
+            encryption=pymupdf.PDF_ENCRYPT_AES_256,
+            user_pw=user_pw,
+            owner_pw=owner_pw or user_pw,
+            permissions=perms,
+            garbage=3,
+            deflate=True,
+        )
+    return {
+        'name': out_path.name,
+        'path': str(out_path),
+        'pages': pages,
+        'output_size': out_path.stat().st_size,
+        'output_dir': str(out_dir),
+    }
+
+
+def unlock_pdf(path_str, password='', out_dir=None):
+    """解除 PDF 打开密码（需已知密码）以及打印/复制等权限限制。"""
+    out_dir = Path(out_dir or OUTPUT_DIR)
+    src = Path(path_str)
+    if not src.exists():
+        raise FileNotFoundError('PDF 文件不存在')
+
+    out_path = unique_path(out_dir, f'{_clean_stem(src)}_解锁', '.pdf')
+    with pymupdf.open(src) as doc:
+        if doc.needs_pass:
+            if not password or not doc.authenticate(password):
+                raise ValueError('密码不正确，无法解锁该 PDF')
+        elif password:
+            # 即使无需打开密码，若提供了权限密码也可尝试验证
+            doc.authenticate(password)
+        pages = len(doc)
+        doc.save(
+            out_path,
+            encryption=pymupdf.PDF_ENCRYPT_NONE,
+            garbage=3,
+            deflate=True,
+        )
     return {
         'name': out_path.name,
         'path': str(out_path),

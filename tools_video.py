@@ -1,13 +1,16 @@
-"""视频工坊：ffprobe 编码检测、一键转 Win 通用 MP4（无损换壳/NVENC/x264）、压缩、裁剪、提音频、转 GIF。"""
+"""视频工坊：ffprobe 编码检测、一键转 Win 通用 MP4（无损换壳/NVENC/x264）、压缩、裁剪、旋转、多视频合并、提音频、转 GIF、批量截图、字幕互转。"""
 import json
 from pathlib import Path
+import re
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
+import zipfile
 
-from tools_files import OUTPUT_DIR, clean_stem, unique_path
+from tools_files import OUTPUT_DIR, UPLOAD_DIR, clean_stem, ensure_dirs, unique_path
 
 _NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 _NVENC_CACHE = None
@@ -248,8 +251,8 @@ class VideoTaskManager:
         ).start()
         return self.get(task_id)
 
-    def _video_encoder_args(self, use_nvenc, quality, scale_height=0):
-        vf = []
+    def _video_encoder_args(self, use_nvenc, quality, scale_height=0, extra_vf=None):
+        vf = list(extra_vf or [])
         if scale_height and int(scale_height) > 0:
             # 保持宽高比且确保宽高均为偶数
             vf.append(f'scale=-2:min(ih\\,{int(scale_height)})')
@@ -263,6 +266,131 @@ class VideoTaskManager:
         crf_map = {'high': '19', 'balanced': '23', 'small': '28'}
         crf = crf_map.get(quality, '23')
         return vf_args + ['-c:v', 'libx264', '-preset', 'medium', '-crf', crf], 'x264 CPU 编码'
+
+    def _raw_encoder_args(self, use_nvenc, quality):
+        """仅返回视频编码器参数（不含 -vf），用于已由 filter_complex 处理滤镜链的场景。"""
+        if use_nvenc and has_nvenc():
+            cq_map = {'high': '21', 'balanced': '25', 'small': '30'}
+            cq = cq_map.get(quality, '25')
+            return ['-c:v', 'h264_nvenc', '-preset', 'p5', '-rc', 'vbr', '-cq', cq, '-b:v', '0'], 'NVENC 显卡硬编'
+        crf_map = {'high': '19', 'balanced': '23', 'small': '28'}
+        crf = crf_map.get(quality, '23')
+        return ['-c:v', 'libx264', '-preset', 'medium', '-crf', crf], 'x264 CPU 编码'
+
+    def start_merge(self, paths, options=None):
+        """后台合并多个视频（支持无损秒合或兼容不同分辨率/编码的统一重编码合并）。"""
+        if not paths or len(paths) < 2:
+            raise ValueError('请至少选择 2 个视频文件进行合并')
+        ffmpeg, _ = ffmpeg_bins()
+        if not ffmpeg:
+            raise RuntimeError('未找到 ffmpeg，请确认已安装 FFmpeg')
+        with self._lock:
+            running = sum(1 for t in self._tasks.values() if t.get('status') == 'running')
+            if running >= self.MAX_CONCURRENT:
+                raise RuntimeError('已有视频任务正在处理中，请等待完成或先取消当前任务')
+
+        options = options or {}
+        infos = [probe_video(p) for p in paths]
+        total_dur = sum(i['duration'] or 0.0 for i in infos)
+        total_size = sum(i['size_bytes'] or 0 for i in infos)
+        out_dir = Path(options.get('output_dir') or OUTPUT_DIR)
+        out_path = unique_path(out_dir, '合并视频', '.mp4')
+        reencode = bool(options.get('reencode', False))
+        use_nvenc = bool(options.get('use_nvenc', True))
+        quality = options.get('quality', 'balanced')
+
+        base = [ffmpeg, '-y', '-hide_banner', '-loglevel', 'error', '-progress', 'pipe:1', '-nostats']
+        cleanup_paths = []
+
+        if not reencode:
+            ensure_dirs()
+            list_file = UPLOAD_DIR / f'concat_{uuid.uuid4().hex[:8]}.txt'
+            lines = []
+            for p in paths:
+                resolved = str(Path(p).resolve()).replace('\\', '/').replace("'", "'\\''")
+                lines.append(f"file '{resolved}'")
+            list_file.write_text('\n'.join(lines), encoding='utf-8')
+            cleanup_paths.append(list_file)
+            cmd = base + ['-f', 'concat', '-safe', '0', '-i', str(list_file),
+                          '-c', 'copy', '-movflags', '+faststart', str(out_path)]
+            mode_desc = f'无损快速合并 ({len(paths)} 段视频)'
+        else:
+            # 以首个有尺寸的视频为目标画布（保证宽高为偶数）
+            first_w = next((i['width'] for i in infos if i['width'] > 0), 1280)
+            first_h = next((i['height'] for i in infos if i['height'] > 0), 720)
+            tw = first_w if first_w % 2 == 0 else first_w + 1
+            th = first_h if first_h % 2 == 0 else first_h + 1
+            has_any_audio = any(i['audio_codec'] != '无音轨' for i in infos)
+
+            in_args = []
+            for p in paths:
+                in_args += ['-i', str(Path(p).resolve())]
+
+            fc_parts = []
+            concat_inputs = []
+            for idx, info in enumerate(infos):
+                fc_parts.append(
+                    f'[{idx}:v:0]scale={tw}:{th}:force_original_aspect_ratio=decrease,'
+                    f'pad={tw}:{th}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,format=yuv420p[v{idx}]'
+                )
+                concat_inputs.append(f'[v{idx}]')
+                if has_any_audio:
+                    if info['audio_codec'] != '无音轨':
+                        fc_parts.append(
+                            f'[{idx}:a:0]aformat=sample_rates=44100:channel_layouts=stereo,aresample=async=1[a{idx}]'
+                        )
+                    else:
+                        dur = max(0.1, info['duration'] or 1.0)
+                        fc_parts.append(
+                            f'anullsrc=channel_layout=stereo:sample_rate=44100,atrim=0:{dur:.3f}[a{idx}]'
+                        )
+                    concat_inputs.append(f'[a{idx}]')
+
+            if has_any_audio:
+                fc_parts.append(f'{"".join(concat_inputs)}concat=n={len(paths)}:v=1:a=1[outv][outa]')
+                map_args = ['-map', '[outv]', '-map', '[outa]', '-c:a', 'aac', '-b:a', '192k']
+            else:
+                fc_parts.append(f'{"".join(concat_inputs)}concat=n={len(paths)}:v=1:a=0[outv]')
+                map_args = ['-map', '[outv]', '-an']
+
+            enc_args, enc_name = self._raw_encoder_args(use_nvenc, quality)
+            cmd = base + in_args + ['-filter_complex', ';'.join(fc_parts)] + map_args + enc_args + [
+                '-movflags', '+faststart', str(out_path)
+            ]
+            mode_desc = f'统一重编码合并 {len(paths)} 段 ({enc_name})'
+
+        task_id = uuid.uuid4().hex[:12]
+        task = {
+            'id': task_id,
+            'status': 'running',
+            'progress': 0,
+            'speed': '',
+            'mode_desc': mode_desc,
+            'output_path': str(out_path),
+            'output_name': out_path.name,
+            'input_size': total_size,
+            'output_size': 0,
+            'error': '',
+            'cancelled': False,
+            'started_at': time.time(),
+            '_proc': None,
+        }
+        with self._lock:
+            running = sum(1 for t in self._tasks.values() if t.get('status') == 'running')
+            if running >= self.MAX_CONCURRENT:
+                for cp in cleanup_paths:
+                    cp.unlink(missing_ok=True)
+                raise RuntimeError('已有视频任务正在处理中，请等待完成或先取消当前任务')
+            self._prune_locked()
+            self._tasks[task_id] = task
+
+        threading.Thread(
+            target=self._run_task,
+            args=(task_id, cmd, out_path, max(0.5, total_dur), cleanup_paths),
+            name=f'ffmpeg-{task_id}',
+            daemon=True,
+        ).start()
+        return self.get(task_id)
 
     def _build_command(self, ffmpeg, src, info, mode, options, out_dir):
         duration = info['duration'] or 0.0
@@ -367,9 +495,29 @@ class VideoTaskManager:
             cmd = base + pre + ['-i', str(src)] + post + ['-vf', vf, '-loop', '0', str(out_path)]
             return cmd, out_path, f'生成高清 GIF ({width}px / {fps}fps)', est
 
+        if mode == 'rotate':
+            rot_map = {
+                'cw90': ('transpose=1', '顺时针90°'),
+                'ccw90': ('transpose=2', '逆时针90°'),
+                '180': ('transpose=1,transpose=1', '旋转180°'),
+                'flip_h': ('hflip', '水平镜像'),
+                'flip_v': ('vflip', '垂直翻转'),
+            }
+            op = options.get('rotate_op', 'cw90')
+            if op not in rot_map:
+                raise ValueError(f'不支持的视频旋转/翻转方式: {op}')
+            rot_vf, label = rot_map[op]
+            out_path = unique_path(out_dir, f'{stem}_旋转', '.mp4')
+            v_args, enc_name = self._video_encoder_args(use_nvenc, quality, extra_vf=[rot_vf])
+            a_args = ['-c:a', 'copy'] if info['can_remux_audio'] else ['-c:a', 'aac', '-b:a', '192k']
+            cmd = base + ['-i', str(src), '-map', '0:v:0', '-map', '0:a?'] + v_args + a_args + [
+                '-movflags', '+faststart', str(out_path)
+            ]
+            return cmd, out_path, f'画面{label}（{enc_name}）', duration
+
         raise ValueError(f'不支持的视频处理模式: {mode}')
 
-    def _run_task(self, task_id, cmd, out_path, est_duration):
+    def _run_task(self, task_id, cmd, out_path, est_duration, cleanup_paths=None):
         stderr_lines = []
         try:
             proc = subprocess.Popen(
@@ -428,6 +576,253 @@ class VideoTaskManager:
             with self._lock:
                 self._tasks[task_id]['status'] = 'error'
                 self._tasks[task_id]['error'] = str(err)
+        finally:
+            for cp in (cleanup_paths or []):
+                try:
+                    Path(cp).unlink(missing_ok=True)
+                except OSError:
+                    pass
 
 
 video_tasks = VideoTaskManager()
+
+
+def export_video_frames(path_str, mode='interval', interval=2.0, count=10,
+                        fmt='jpg', start='', end='', out_dir=None):
+    """批量导出视频截图（按固定间隔秒数或均匀截取指定张数），单张直接输出，多张打包 ZIP。"""
+    ffmpeg, _ = ffmpeg_bins()
+    if not ffmpeg:
+        raise RuntimeError('未找到 ffmpeg，请确认已安装 FFmpeg')
+    info = probe_video(path_str)
+    src = Path(path_str)
+    out_dir = Path(out_dir or OUTPUT_DIR)
+    stem = clean_stem(src)
+
+    ext = '.png' if (fmt or 'jpg').lower() == 'png' else '.jpg'
+    start_s = _parse_time_str(start)
+    end_s = _parse_time_str(end)
+    start_sec = _time_to_seconds(start_s)
+    end_sec = _time_to_seconds(end_s) if end_s else 0.0
+    if end_s and end_sec <= start_sec:
+        raise ValueError('结束时间必须大于开始时间')
+    duration = info['duration'] or 0.0
+    span = (end_sec - start_sec) if end_s else max(0.5, duration - start_sec)
+
+    max_frames = 200
+    if mode == 'count':
+        n = max(1, min(max_frames, int(count or 10)))
+        fps_val = n / max(0.5, span)
+        limit_args = ['-frames:v', str(n)]
+    else:
+        iv = max(0.2, float(interval or 2.0))
+        fps_val = 1.0 / iv
+        limit_args = ['-frames:v', str(max_frames)]
+
+    pre = ['-ss', start_s] if start_s else []
+    post = ['-t', f'{(end_sec - start_sec):.3f}'] if end_s else []
+    q_args = ['-q:v', '2'] if ext == '.jpg' else []
+
+    with tempfile.TemporaryDirectory(prefix='tb_frames_') as tmp:
+        pattern = str(Path(tmp) / f'frame_%04d{ext}')
+        cmd = [ffmpeg, '-y', '-hide_banner', '-loglevel', 'error'] + pre + [
+            '-i', str(src),
+        ] + post + ['-vf', f'fps={fps_val:.6f}'] + q_args + limit_args + [pattern]
+        run = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8',
+                             errors='replace', timeout=120, creationflags=_NO_WINDOW)
+        if run.returncode != 0:
+            raise RuntimeError(run.stderr.strip() or '视频截图导出失败')
+        frames = sorted(Path(tmp).glob(f'frame_*{ext}'))
+        if not frames:
+            raise RuntimeError('未截取到任何画面帧，请检查时间范围或视频时长')
+
+        if len(frames) == 1:
+            out_path = unique_path(out_dir, f'{stem}_截图', ext)
+            shutil.copy2(frames[0], out_path)
+            return {
+                'count': 1,
+                'name': out_path.name,
+                'path': str(out_path),
+                'preview_path': str(out_path),
+                'output_size': out_path.stat().st_size,
+                'output_dir': str(out_dir),
+            }
+
+        zip_path = unique_path(out_dir, f'{stem}_截图_{len(frames)}张', '.zip')
+        with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED) as zf:
+            for idx, fp in enumerate(frames, 1):
+                zf.write(fp, arcname=f'{stem}_截图_{idx:03d}{ext}')
+        return {
+            'count': len(frames),
+            'name': zip_path.name,
+            'path': str(zip_path),
+            'preview_path': '',
+            'output_size': zip_path.stat().st_size,
+            'output_dir': str(out_dir),
+        }
+
+
+# ==================== 字幕格式互转（SRT / VTT / ASS） ====================
+
+def _decode_text_bytes(raw_bytes):
+    """按常见中文与国际编码顺序自动解码文本字节。"""
+    for enc in ('utf-8-sig', 'utf-8', 'gb18030', 'utf-16', 'big5'):
+        try:
+            return raw_bytes.decode(enc), enc
+        except UnicodeDecodeError:
+            continue
+    return raw_bytes.decode('utf-8', errors='replace'), 'utf-8(replace)'
+
+
+def _ts_to_ms(ts_str):
+    """解析 SRT/VTT/ASS 时间戳为毫秒整数。"""
+    s = ts_str.strip().replace(',', '.')
+    parts = s.split(':')
+    if len(parts) == 2:
+        h, m, sec = 0, int(parts[0]), float(parts[1])
+    elif len(parts) == 3:
+        h, m, sec = int(parts[0]), int(parts[1]), float(parts[2])
+    else:
+        raise ValueError(f'无法识别的时间戳: {ts_str}')
+    return max(0, int(round((h * 3600 + m * 60 + sec) * 1000)))
+
+
+def _ms_to_srt(ms):
+    h, rem = divmod(max(0, int(ms)), 3600_000)
+    m, rem = divmod(rem, 60_000)
+    s, frac = divmod(rem, 1000)
+    return f'{h:02d}:{m:02d}:{s:02d},{frac:03d}'
+
+
+def _ms_to_vtt(ms):
+    return _ms_to_srt(ms).replace(',', '.')
+
+
+def _ms_to_ass(ms):
+    h, rem = divmod(max(0, int(ms)), 3600_000)
+    m, rem = divmod(rem, 60_000)
+    s, frac = divmod(rem, 1000)
+    cs = frac // 10
+    return f'{h}:{m:02d}:{s:02d}.{cs:02d}'
+
+
+def _parse_srt_or_vtt(text):
+    text = text.replace('\r\n', '\n').replace('\r', '\n')
+    cues = []
+    blocks = re.split(r'\n{2,}', text.strip())
+    time_re = re.compile(
+        r'(\d{1,2}:\d{2}(?::\d{2})?[.,]\d{1,3})\s*-->\s*(\d{1,2}:\d{2}(?::\d{2})?[.,]\d{1,3})'
+    )
+    for blk in blocks:
+        lines = [ln for ln in blk.split('\n') if ln.strip() != '']
+        if not lines:
+            continue
+        if lines[0].upper().startswith(('WEBVTT', 'NOTE', 'STYLE', 'REGION')):
+            continue
+        m_idx = -1
+        m_obj = None
+        for i, ln in enumerate(lines):
+            m = time_re.search(ln)
+            if m:
+                m_idx = i
+                m_obj = m
+                break
+        if m_obj is None:
+            continue
+        start_ms = _ts_to_ms(m_obj.group(1))
+        end_ms = _ts_to_ms(m_obj.group(2))
+        body = '\n'.join(lines[m_idx + 1:]).strip()
+        # 去除 VTT/SRT 中简单的 HTML 标签（保留纯文本）
+        body = re.sub(r'</?(?:i|b|u|c(?:\.[^>]*)?|v[^>]*)>', '', body)
+        if body:
+            cues.append((start_ms, end_ms, body))
+    return cues
+
+
+def _parse_ass(text):
+    text = text.replace('\r\n', '\n').replace('\r', '\n')
+    cues = []
+    for ln in text.split('\n'):
+        if not ln.startswith('Dialogue:'):
+            continue
+        body_part = ln.split(':', 1)[1].strip()
+        # ASS Dialogue 固定前 9 个逗号字段，第 10 个字段起为正文（正文可能含逗号）
+        fields = body_part.split(',', 9)
+        if len(fields) < 10:
+            continue
+        try:
+            start_ms = _ts_to_ms(fields[1])
+            end_ms = _ts_to_ms(fields[2])
+        except ValueError:
+            continue
+        raw_txt = fields[9]
+        # 去掉 {\...} 覆盖标签，将 \N / \n 还原为换行
+        clean = re.sub(r'\{[^}]*\}', '', raw_txt)
+        clean = clean.replace('\\N', '\n').replace('\\n', '\n').strip()
+        if clean:
+            cues.append((start_ms, end_ms, clean))
+    return cues
+
+
+def convert_subtitle(path_str, target_fmt='srt', out_dir=None):
+    """纯离线字幕格式互转（支持 .srt / .vtt / .ass / .ssa 互转，统一输出标准 UTF-8）。"""
+    src = Path(path_str)
+    if not src.exists():
+        raise FileNotFoundError('字幕文件不存在')
+    target_fmt = (target_fmt or 'srt').lower().lstrip('.')
+    if target_fmt not in ('srt', 'vtt', 'ass'):
+        raise ValueError(f'不支持的目标字幕格式: {target_fmt}')
+
+    raw_text, detected_enc = _decode_text_bytes(src.read_bytes())
+    src_ext = src.suffix.lower()
+    if src_ext in ('.ass', '.ssa') or '[Events]' in raw_text:
+        cues = _parse_ass(raw_text)
+    else:
+        cues = _parse_srt_or_vtt(raw_text)
+
+    if not cues:
+        raise ValueError('未能从文件中解析出有效字幕条目，请确认文件为标准 SRT / VTT / ASS 格式')
+
+    if target_fmt == 'srt':
+        out_text = '\n\n'.join(
+            f'{idx}\n{_ms_to_srt(s)} --> {_ms_to_srt(e)}\n{txt}'
+            for idx, (s, e, txt) in enumerate(cues, 1)
+        ) + '\n'
+    elif target_fmt == 'vtt':
+        body = '\n\n'.join(
+            f'{_ms_to_vtt(s)} --> {_ms_to_vtt(e)}\n{txt}'
+            for s, e, txt in cues
+        )
+        out_text = f'WEBVTT\n\n{body}\n'
+    else:
+        header = (
+            '[Script Info]\n'
+            'ScriptType: v4.00+\n'
+            'PlayResX: 1920\n'
+            'PlayResY: 1080\n'
+            'ScaledBorderAndShadow: yes\n\n'
+            '[V4+ Styles]\n'
+            'Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, '
+            'Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, '
+            'Alignment, MarginL, MarginR, MarginV, Encoding\n'
+            'Style: Default,Microsoft YaHei,54,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,'
+            '0,0,0,0,100,100,0,0,1,2,1,2,20,20,30,1\n\n'
+            '[Events]\n'
+            'Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n'
+        )
+        lines = [
+            f'Dialogue: 0,{_ms_to_ass(s)},{_ms_to_ass(e)},Default,,0,0,0,,{txt.replace(chr(10), r"\N")}'
+            for s, e, txt in cues
+        ]
+        out_text = header + '\n'.join(lines) + '\n'
+
+    out_dir = Path(out_dir or OUTPUT_DIR)
+    out_path = unique_path(out_dir, f'{clean_stem(src)}_转换', f'.{target_fmt}')
+    out_path.write_text(out_text, encoding='utf-8')
+    return {
+        'name': out_path.name,
+        'path': str(out_path),
+        'cues': len(cues),
+        'detected_encoding': detected_enc,
+        'output_size': out_path.stat().st_size,
+        'output_dir': str(out_dir),
+    }

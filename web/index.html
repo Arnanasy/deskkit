@@ -82,8 +82,10 @@
           <button class="subtab active" data-sub="v-compat">一键转 Win 通用 MP4</button>
           <button class="subtab" data-sub="v-compress">压小体积</button>
           <button class="subtab" data-sub="v-trim">时间裁剪</button>
+          <button class="subtab" data-sub="v-rotate">画面旋转</button>
           <button class="subtab" data-sub="v-audio">提取音频</button>
           <button class="subtab" data-sub="v-gif">视频转 GIF</button>
+          <button class="subtab" data-sub="v-frames">批量截图</button>
         </div>
 
         <div class="subpanel active" id="v-compat">
@@ -135,9 +137,37 @@
             <div class="field"><label>结束时间（留空到结尾）</label><input type="text" id="vtrim-end" placeholder="00:01:00"></div>
             <div class="field" style="justify-content:flex-end;">
               <label class="checkbox-row"><input type="checkbox" id="vtrim-lossless"> 尝试无损快剪（秒完成，精度到关键帧）</label>
+              <label class="checkbox-row"><input type="checkbox" id="vtrim-nvenc" checked> 启用显卡硬件加速 (NVENC)</label>
             </div>
           </div>
           <button class="btn btn-primary" id="btn-run-trim">✂️ 开始裁剪</button>
+        </div>
+
+        <div class="subpanel" id="v-rotate">
+          <div class="grid-3" style="margin-bottom:12px;">
+            <div class="field">
+              <label>旋转 / 翻转方向</label>
+              <select id="vrot-op">
+                <option value="cw90">顺时针旋转 90°</option>
+                <option value="ccw90">逆时针旋转 90°</option>
+                <option value="180">旋转 180°（上下颠倒纠正）</option>
+                <option value="flip_h">水平镜像翻转</option>
+                <option value="flip_v">垂直上下翻转</option>
+              </select>
+            </div>
+            <div class="field">
+              <label>画质档位</label>
+              <select id="vrot-quality">
+                <option value="high">高画质</option>
+                <option value="balanced" selected>均衡推荐</option>
+                <option value="small">小体积</option>
+              </select>
+            </div>
+            <div class="field" style="justify-content:flex-end;">
+              <label class="checkbox-row"><input type="checkbox" id="vrot-nvenc" checked> 启用显卡硬件加速 (NVENC)</label>
+            </div>
+          </div>
+          <button class="btn btn-primary" id="btn-run-rotate">🔄 开始旋转画面</button>
         </div>
 
         <div class="subpanel" id="v-audio">
@@ -164,6 +194,28 @@
           <button class="btn btn-primary" id="btn-run-gif">🎞️ 生成高清 GIF</button>
         </div>
 
+        <div class="subpanel" id="v-frames">
+          <div class="grid-3" style="margin-bottom:12px;">
+            <div class="field">
+              <label>截取方式</label>
+              <select id="vfr-mode">
+                <option value="interval">按固定间隔秒数截图</option>
+                <option value="count">均匀截取指定张数</option>
+              </select>
+            </div>
+            <div class="field"><label>间隔秒数（间隔模式生效）</label><input type="number" id="vfr-interval" value="2" min="0.2" step="0.5"></div>
+            <div class="field"><label>总张数（张数模式生效，上限 200）</label><input type="number" id="vfr-count" value="10" min="1" max="200"></div>
+            <div class="field"><label>开始时间（留空从头开始）</label><input type="text" id="vfr-start" placeholder="00:00:00"></div>
+            <div class="field"><label>结束时间（留空到结尾）</label><input type="text" id="vfr-end" placeholder=""></div>
+            <div class="field">
+              <label>截图格式</label>
+              <select id="vfr-fmt"><option value="jpg" selected>JPG（小体积）</option><option value="png">PNG（无损）</option></select>
+            </div>
+          </div>
+          <button class="btn btn-primary" id="btn-run-frames">📸 批量导出截图</button>
+          <div id="v-frames-result"></div>
+        </div>
+
         <div id="video-progress-box" style="display:none; margin-top:16px; padding-top:14px; border-top:1px solid var(--border);">
           <div class="row" style="justify-content:space-between;">
             <span id="vp-desc">处理中…</span>
@@ -174,19 +226,77 @@
           <div id="vp-preview"></div>
         </div>
       </div>
+
+      <!-- 多视频合并 与 字幕格式互转（无需先选主视频） -->
+      <div class="card">
+        <div class="subtabs" data-group="video-extra">
+          <button class="subtab active" data-sub="v-merge">合并多个视频</button>
+          <button class="subtab" data-sub="v-sub">字幕格式互转 (SRT / VTT / ASS)</button>
+        </div>
+
+        <div class="subpanel active" id="v-merge">
+          <div class="dropzone" id="vmerge-drop" style="padding:18px 14px;">
+            <div class="dropzone-title">拖入多个视频按顺序合并</div>
+            <div class="dropzone-sub">支持拖拽或点击上下箭头调整顺序；大视频推荐点「选多个视频」零拷贝合并</div>
+            <div class="dropzone-actions">
+              <button class="btn btn-primary btn-sm" id="btn-vmerge-pick">📁 选多个视频</button>
+              <button class="btn btn-sm" id="btn-vmerge-clear">清空</button>
+            </div>
+          </div>
+          <div class="file-list" id="vmerge-list"></div>
+          <div class="row" style="margin:12px 0;">
+            <label class="checkbox-row"><input type="checkbox" id="vmerge-reencode"> 统一重编码合并（不同分辨率/编码的视频请勾选）</label>
+            <label class="checkbox-row"><input type="checkbox" id="vmerge-nvenc" checked> 启用显卡硬件加速 (NVENC)</label>
+          </div>
+          <button class="btn btn-primary" id="btn-run-vmerge">🎞️ 开始合并视频</button>
+          <div id="vmerge-progress-box" style="display:none; margin-top:14px; padding-top:12px; border-top:1px solid var(--border);">
+            <div class="row" style="justify-content:space-between;">
+              <span id="vmp-desc">合并中…</span>
+              <span id="vmp-stat" class="badge badge-info">0%</span>
+            </div>
+            <div class="progress-wrap"><div class="progress-bar" id="vmp-bar"></div></div>
+            <div class="row" id="vmp-actions"></div>
+            <div id="vmp-preview"></div>
+          </div>
+        </div>
+
+        <div class="subpanel" id="v-sub">
+          <div class="dropzone" id="vsub-drop" style="padding:18px 14px;">
+            <div class="dropzone-title">拖入字幕文件（SRT / VTT / ASS / SSA）</div>
+            <div class="dropzone-sub">自动识别 UTF-8 / GBK / GB18030 编码，转换后统一输出标准 UTF-8</div>
+            <div class="dropzone-actions">
+              <button class="btn btn-primary btn-sm" id="btn-vsub-pick">📁 选择字幕文件</button>
+              <button class="btn btn-sm btn-danger" id="btn-vsub-clear" style="display:none;">🗑️ 移除</button>
+            </div>
+          </div>
+          <div id="vsub-meta" class="meta" style="margin:8px 0;font-size:12px;"></div>
+          <div class="row" style="margin-top:8px;">
+            <div class="field" style="min-width:180px;">
+              <label>转换为目标格式</label>
+              <select id="vsub-fmt">
+                <option value="srt" selected>SRT（通用字幕）</option>
+                <option value="vtt">WebVTT (.vtt 网页字幕)</option>
+                <option value="ass">ASS（带中文样式字幕）</option>
+              </select>
+            </div>
+            <button class="btn btn-primary" id="btn-vsub-run" style="align-self:flex-end;">🔤 开始转换字幕</button>
+          </div>
+          <div id="vsub-result"></div>
+        </div>
+      </div>
     </section>
 
     <!-- ==================== 2. 图片工坊 ==================== -->
     <section class="panel" id="panel-image">
       <div class="card">
         <div class="dropzone" id="img-drop">
-          <div class="dropzone-title">拖入一张或多张图片</div>
-          <div class="dropzone-sub">支持 JPG / PNG / WEBP / BMP / TIFF；自动纠正手机拍照方向</div>
+          <div class="dropzone-title">拖入一张或多张图片（支持拖拽或箭头调整顺序）</div>
+          <div class="dropzone-sub">支持 JPG / PNG / WEBP / HEIC / AVIF / BMP / TIFF；自动纠正手机拍照方向</div>
           <div class="dropzone-actions">
             <button class="btn btn-primary" id="btn-img-pick">📁 选本机图片</button>
             <button class="btn" id="btn-img-upload">⬆️ 浏览器选择</button>
             <button class="btn btn-sm" id="btn-img-clear">清空列表</button>
-            <input type="file" id="img-file-input" accept="image/*" multiple hidden>
+            <input type="file" id="img-file-input" accept="image/*,.heic,.heif,.avif" multiple hidden>
           </div>
         </div>
         <div class="file-list" id="img-file-list"></div>
@@ -196,22 +306,26 @@
         <div class="subtabs" data-group="image">
           <button class="subtab active" data-sub="img-convert">批量压缩 / 转格式 / 去 EXIF</button>
           <button class="subtab" data-sub="img-stitch">拼长图 / 拼宫格</button>
+          <button class="subtab" data-sub="img-rotate">批量旋转 / 翻转</button>
+          <button class="subtab" data-sub="img-split">长图分割 / 九宫格</button>
         </div>
 
         <div class="subpanel active" id="img-convert">
-          <div class="grid-3" style="margin-bottom:12px;">
+          <div class="grid-2" style="margin-bottom:12px;">
             <div class="field">
-              <label>目标格式</label>
+              <label>目标格式（HEIC/AVIF 可一键转 JPG/PNG）</label>
               <select id="img-fmt">
-                <option value="keep">保持原格式</option>
+                <option value="keep">保持原格式（HEIC 自动转 JPG）</option>
                 <option value="jpg">JPG（通用小体积）</option>
                 <option value="webp">WEBP（更小体积）</option>
+                <option value="avif">AVIF（极限高压缩）</option>
                 <option value="png">PNG（无损透明）</option>
                 <option value="ico">ICO（桌面图标）</option>
               </select>
             </div>
             <div class="field"><label>压缩质量（10-100）</label><input type="number" id="img-quality" value="82" min="10" max="100"></div>
-            <div class="field"><label>限制最大宽度（0 为不缩放）</label><input type="number" id="img-maxw" value="0" min="0"></div>
+            <div class="field"><label>限制最大宽度（像素，0 为不缩放）</label><input type="number" id="img-maxw" value="0" min="0"></div>
+            <div class="field"><label>限制最大高度（像素，0 为不缩放）</label><input type="number" id="img-maxh" value="0" min="0"></div>
           </div>
           <div class="row" style="margin-bottom:12px;">
             <label class="checkbox-row"><input type="checkbox" id="img-strip-exif" checked> 清除拍摄定位 / 相机 EXIF 隐私信息</label>
@@ -241,6 +355,54 @@
           <button class="btn btn-primary" id="btn-stitch-run">🧩 生成拼接图</button>
         </div>
 
+        <div class="subpanel" id="img-rotate">
+          <div class="grid-2" style="margin-bottom:12px;">
+            <div class="field">
+              <label>旋转 / 翻转方式（作用于上方全部图片）</label>
+              <select id="img-rot-op">
+                <option value="cw90">顺时针旋转 90°</option>
+                <option value="ccw90">逆时针旋转 90°</option>
+                <option value="180">旋转 180°</option>
+                <option value="flip_h">水平镜像翻转</option>
+                <option value="flip_v">垂直上下翻转</option>
+              </select>
+            </div>
+            <div class="field">
+              <label>输出格式</label>
+              <select id="img-rot-fmt">
+                <option value="keep">保持原格式</option>
+                <option value="jpg">JPG</option>
+                <option value="png">PNG</option>
+                <option value="webp">WEBP</option>
+              </select>
+            </div>
+          </div>
+          <button class="btn btn-primary" id="btn-img-rot-run">🔄 开始批量旋转 / 翻转</button>
+        </div>
+
+        <div class="subpanel" id="img-split">
+          <p style="font-size:12px;color:var(--muted);margin:0 0 10px;">将上方列表中的<strong>第 1 张图片</strong>切割为多张图片并打包 ZIP（可上下移动调整第 1 张）。</p>
+          <div class="grid-3" style="margin-bottom:12px;">
+            <div class="field">
+              <label>分割模式</label>
+              <select id="split-mode">
+                <option value="vertical">竖向切长图</option>
+                <option value="horizontal">横向均分切图</option>
+                <option value="grid">宫格切图（如九宫格）</option>
+              </select>
+            </div>
+            <div class="field"><label>切分份数（竖向/横向均分）</label><input type="number" id="split-parts" value="3" min="2" max="50"></div>
+            <div class="field"><label>单段最大高度 px（>0 时优先按高度竖切）</label><input type="number" id="split-maxh" value="0" min="0"></div>
+            <div class="field"><label>宫格行数（仅宫格生效）</label><input type="number" id="split-rows" value="3" min="1" max="10"></div>
+            <div class="field"><label>宫格列数（仅宫格生效）</label><input type="number" id="split-cols" value="3" min="1" max="10"></div>
+            <div class="field">
+              <label>输出格式</label>
+              <select id="split-fmt"><option value="png">PNG</option><option value="jpg">JPG</option></select>
+            </div>
+          </div>
+          <button class="btn btn-primary" id="btn-split-run">✂️ 开始分割图片</button>
+        </div>
+
         <div id="img-result"></div>
       </div>
     </section>
@@ -255,6 +417,7 @@
           <button class="subtab" data-sub="pdf-to-img">PDF 转图片</button>
           <button class="subtab" data-sub="pdf-from-img">多图合 PDF</button>
           <button class="subtab" data-sub="pdf-compress">PDF 压缩</button>
+          <button class="subtab" data-sub="pdf-protect">加密 / 解锁</button>
         </div>
 
         <!-- PDF 与 Word 互转 -->
@@ -293,7 +456,7 @@
         <!-- 合并 -->
         <div class="subpanel" id="pdf-merge">
           <div class="dropzone" id="pdf-merge-drop">
-            <div class="dropzone-title">拖入多个 PDF 文件按顺序合并</div>
+            <div class="dropzone-title">拖入多个 PDF 文件按顺序合并（支持拖拽或箭头调整顺序）</div>
             <div class="dropzone-actions">
               <button class="btn btn-primary" id="btn-pdf-merge-pick">📁 选多个 PDF</button>
               <button class="btn btn-sm" id="btn-pdf-merge-clear">清空</button>
@@ -305,11 +468,14 @@
 
         <!-- 编辑单 PDF -->
         <div class="subpanel" id="pdf-edit">
-          <div class="row" style="margin-bottom:12px;">
-            <button class="btn btn-primary" id="btn-pdf-edit-pick">📁 选择 PDF 文件</button>
-            <button class="btn btn-sm btn-danger" id="btn-pdf-edit-clear" style="display:none;">🗑️ 移除</button>
-            <span id="pdf-edit-meta" class="meta"></span>
+          <div class="dropzone" id="pdf-edit-drop" style="padding:18px 14px; margin-bottom:10px;">
+            <div class="dropzone-sub" style="margin-bottom:8px;">拖入单个 PDF 文件或点击选择</div>
+            <div class="dropzone-actions">
+              <button class="btn btn-primary btn-sm" id="btn-pdf-edit-pick">📁 选择 PDF 文件</button>
+              <button class="btn btn-sm btn-danger" id="btn-pdf-edit-clear" style="display:none;">🗑️ 移除</button>
+            </div>
           </div>
+          <div id="pdf-edit-meta" class="meta" style="margin-bottom:10px; font-size:12px;"></div>
           <div class="grid-3" style="margin-bottom:12px;">
             <div class="field">
               <label>操作类型</label>
@@ -330,11 +496,14 @@
 
         <!-- PDF 转图片 -->
         <div class="subpanel" id="pdf-to-img">
-          <div class="row" style="margin-bottom:12px;">
-            <button class="btn btn-primary" id="btn-pdf-img-pick">📁 选择 PDF 文件</button>
-            <button class="btn btn-sm btn-danger" id="btn-pdf-img-clear" style="display:none;">🗑️ 移除</button>
-            <span id="pdf-img-meta" class="meta"></span>
+          <div class="dropzone" id="pdf-img-drop" style="padding:18px 14px; margin-bottom:10px;">
+            <div class="dropzone-sub" style="margin-bottom:8px;">拖入 PDF 文件或点击选择</div>
+            <div class="dropzone-actions">
+              <button class="btn btn-primary btn-sm" id="btn-pdf-img-pick">📁 选择 PDF 文件</button>
+              <button class="btn btn-sm btn-danger" id="btn-pdf-img-clear" style="display:none;">🗑️ 移除</button>
+            </div>
           </div>
+          <div id="pdf-img-meta" class="meta" style="margin-bottom:10px; font-size:12px;"></div>
           <div class="grid-3" style="margin-bottom:12px;">
             <div class="field"><label>图片格式</label><select id="pdf-img-fmt"><option value="png">PNG（清晰）</option><option value="jpg">JPG（小体积）</option></select></div>
             <div class="field"><label>清晰度 (DPI)</label><select id="pdf-img-dpi"><option value="150">150 DPI（标准）</option><option value="200">200 DPI（高清）</option><option value="300">300 DPI（印刷级）</option></select></div>
@@ -345,9 +514,12 @@
 
         <!-- 多图合 PDF -->
         <div class="subpanel" id="pdf-from-img">
-          <div class="row" style="margin-bottom:12px;">
-            <button class="btn btn-primary" id="btn-pfi-pick">📁 选择多张图片</button>
-            <button class="btn btn-sm" id="btn-pfi-clear">清空</button>
+          <div class="dropzone" id="pfi-drop" style="padding:18px 14px;">
+            <div class="dropzone-title">拖入多张图片合成 PDF（支持拖拽或箭头调整页序）</div>
+            <div class="dropzone-actions">
+              <button class="btn btn-primary btn-sm" id="btn-pfi-pick">📁 选择多张图片</button>
+              <button class="btn btn-sm" id="btn-pfi-clear">清空</button>
+            </div>
           </div>
           <div class="file-list" id="pfi-list"></div>
           <div style="margin-top:12px;"><button class="btn btn-primary" id="btn-pfi-run">📄 合成 PDF</button></div>
@@ -355,11 +527,14 @@
 
         <!-- PDF 压缩 -->
         <div class="subpanel" id="pdf-compress">
-          <div class="row" style="margin-bottom:12px;">
-            <button class="btn btn-primary" id="btn-pdf-comp-pick">📁 选择 PDF 文件</button>
-            <button class="btn btn-sm btn-danger" id="btn-pdf-comp-clear" style="display:none;">🗑️ 移除</button>
-            <span id="pdf-comp-meta" class="meta"></span>
+          <div class="dropzone" id="pdf-comp-drop" style="padding:18px 14px; margin-bottom:10px;">
+            <div class="dropzone-sub" style="margin-bottom:8px;">拖入 PDF 文件或点击选择</div>
+            <div class="dropzone-actions">
+              <button class="btn btn-primary btn-sm" id="btn-pdf-comp-pick">📁 选择 PDF 文件</button>
+              <button class="btn btn-sm btn-danger" id="btn-pdf-comp-clear" style="display:none;">🗑️ 移除</button>
+            </div>
           </div>
+          <div id="pdf-comp-meta" class="meta" style="margin-bottom:10px; font-size:12px;"></div>
           <div class="field" style="max-width:260px; margin-bottom:12px;">
             <label>压缩强度</label>
             <select id="pdf-comp-level">
@@ -369,6 +544,45 @@
             </select>
           </div>
           <button class="btn btn-primary" id="btn-pdf-comp-run">📦 开始压缩 PDF</button>
+        </div>
+
+        <!-- PDF 加密与解锁 -->
+        <div class="subpanel" id="pdf-protect">
+          <div class="dropzone" id="pdf-prot-drop" style="padding:18px 14px; margin-bottom:10px;">
+            <div class="dropzone-sub" style="margin-bottom:8px;">拖入 PDF 文件或点击选择（支持设置加密或已知密码解锁/去除打印复制限制）</div>
+            <div class="dropzone-actions">
+              <button class="btn btn-primary btn-sm" id="btn-pdf-prot-pick">📁 选择 PDF 文件</button>
+              <button class="btn btn-sm btn-danger" id="btn-pdf-prot-clear" style="display:none;">🗑️ 移除</button>
+            </div>
+          </div>
+          <div id="pdf-prot-meta" class="meta" style="margin-bottom:12px; font-size:12px;"></div>
+          <div class="grid-2">
+            <div class="card" style="margin:0; box-shadow:none;">
+              <h3>🔒 加密 / 设置权限限制</h3>
+              <div class="field" style="margin-bottom:8px;">
+                <label>打开密码（留空则可直接打开，仅加权限锁）</label>
+                <input type="password" id="pdf-user-pw" placeholder="输入打开文档所需密码">
+              </div>
+              <div class="field" style="margin-bottom:10px;">
+                <label>权限密码（留空则与打开密码相同）</label>
+                <input type="password" id="pdf-owner-pw" placeholder="输入修改权限所需密码">
+              </div>
+              <div class="row" style="margin-bottom:12px;">
+                <label class="checkbox-row"><input type="checkbox" id="pdf-allow-print" checked> 允许打印</label>
+                <label class="checkbox-row"><input type="checkbox" id="pdf-allow-copy" checked> 允许复制文字</label>
+              </div>
+              <button class="btn btn-primary" id="btn-pdf-protect-run">🔒 生成加密 PDF (AES-256)</button>
+            </div>
+            <div class="card" style="margin:0; box-shadow:none;">
+              <h3>🔓 解除密码 / 去除打印复制限制</h3>
+              <p style="font-size:12px;color:var(--muted);margin:-6px 0 10px;">若文档无打开密码但禁止打印/复制，密码框留空直接点击解锁即可。</p>
+              <div class="field" style="margin-bottom:12px;">
+                <label>已知密码（无打开密码可留空）</label>
+                <input type="password" id="pdf-unlock-pw" placeholder="输入已知密码">
+              </div>
+              <button class="btn btn-primary" id="btn-pdf-unlock-run">🔓 解除加密与限制</button>
+            </div>
+          </div>
         </div>
 
         <div id="pdf-result"></div>
@@ -384,7 +598,9 @@
           <button class="subtab" data-sub="t-qr">离线二维码</button>
           <button class="subtab" data-sub="t-pass">强密码生成</button>
           <button class="subtab" data-sub="t-time">时间戳 / 正则</button>
-          <button class="subtab" data-sub="t-rename">批量文件重命名</button>
+          <button class="subtab" data-sub="t-rename">批量重命名 / 后缀</button>
+          <button class="subtab" data-sub="t-fix">乱码修复 (ZIP / 文本)</button>
+          <button class="subtab" data-sub="t-hash">文件哈希校验</button>
         </div>
 
         <div class="subpanel active" id="t-clean">
@@ -448,17 +664,24 @@
         <div class="subpanel" id="t-time">
           <div class="grid-2" style="margin-bottom:16px;">
             <div class="field">
-              <label>Unix 时间戳（秒或毫秒）→ 北京时间</label>
+              <label>Unix 时间戳（秒或毫秒）→ 本地时间</label>
               <div class="row">
                 <input type="text" id="ts-in" placeholder="如 1730000000" style="flex:1;">
                 <button class="btn btn-sm" id="btn-ts-now">当前时间</button>
               </div>
               <div class="alert alert-ok" id="ts-out" style="margin-top:8px;">—</div>
+              <label style="margin-top:12px;">日期时间 → Unix 时间戳（双向转换）</label>
+              <div class="row">
+                <input type="text" id="ts-date-in" placeholder="如 2026-11-25 12:30:00" style="flex:1;">
+                <button class="btn btn-sm" id="btn-ts-copy-sec">复制秒</button>
+                <button class="btn btn-sm" id="btn-ts-copy-ms">复制毫秒</button>
+              </div>
+              <div class="alert alert-ok" id="ts-date-out" style="margin-top:8px;">—</div>
             </div>
             <div class="field">
               <label>正则快速测试</label>
               <input type="text" id="rx-pat" placeholder="正则表达式，如 \d{4}-\d{2}-\d{2}">
-              <textarea id="rx-text" style="min-height:80px; margin-top:6px;" placeholder="待匹配文本…"></textarea>
+              <textarea id="rx-text" style="min-height:130px; margin-top:6px;" placeholder="待匹配文本…"></textarea>
               <div class="alert alert-ok" id="rx-out" style="margin-top:6px;">匹配结果将显示在这里</div>
             </div>
           </div>
@@ -479,7 +702,14 @@
           </div>
           <div class="row" style="margin-bottom:12px;">
             <label class="checkbox-row"><input type="checkbox" id="rn-regex"> 使用正则查找</label>
-            <label class="checkbox-row"><input type="checkbox" id="rn-num"> 追加连续序号（起始：<input type="number" id="rn-start" value="1" style="width:62px;padding:3px 6px;">）</label>
+            <label class="checkbox-row"><input type="checkbox" id="rn-num"> 追加连续序号（起始：<input type="number" id="rn-start" value="1" style="width:62px;padding:3px 6px;"> 补零位数：<input type="number" id="rn-pad" value="2" min="1" max="12" style="width:54px;padding:3px 6px;">）</label>
+            <label class="checkbox-row">扩展名大小写：
+              <select id="rn-extcase" style="width:auto;padding:4px 8px;">
+                <option value="">保持不变</option>
+                <option value="lower">全部小写</option>
+                <option value="upper">全部大写</option>
+              </select>
+            </label>
             <button class="btn" id="btn-rn-preview">👀 预览改动</button>
             <button class="btn btn-primary" id="btn-rn-exec" disabled>✅ 确认执行重命名</button>
           </div>
@@ -487,6 +717,89 @@
           <div class="table-wrap" id="rn-table-wrap" style="display:none;">
             <table><thead><tr><th>原文件名</th><th>新文件名</th><th>状态</th></tr></thead><tbody id="rn-tbody"></tbody></table>
           </div>
+        </div>
+
+        <div class="subpanel" id="t-fix">
+          <div class="grid-2">
+            <div class="card" style="margin:0; box-shadow:none;">
+              <h3>📦 ZIP 中文文件名乱码修复</h3>
+              <p style="font-size:12px;color:var(--muted);margin:-6px 0 10px;">解决老旧压缩包或跨系统 ZIP 解压中文乱码，重新打包为标准 UTF-8 ZIP</p>
+              <div class="dropzone" id="zipfix-drop" style="padding:16px 12px;">
+                <div class="dropzone-sub" style="margin-bottom:8px;">拖入 ZIP 压缩包或点击选择</div>
+                <div class="dropzone-actions">
+                  <button class="btn btn-primary btn-sm" id="btn-zipfix-pick">📁 选择 ZIP</button>
+                  <button class="btn btn-sm btn-danger" id="btn-zipfix-clear" style="display:none;">🗑️ 移除</button>
+                </div>
+              </div>
+              <div id="zipfix-meta" class="meta" style="margin:8px 0;font-size:12px;"></div>
+              <div class="row" style="margin-bottom:10px;">
+                <div class="field" style="flex:1;">
+                  <label>原文件名编码</label>
+                  <select id="zipfix-enc">
+                    <option value="auto" selected>自动检测（UTF-8 / GB18030 / Big5）</option>
+                    <option value="gb18030">GBK / GB18030（简体中文）</option>
+                    <option value="big5">Big5（繁体中文）</option>
+                    <option value="shift_jis">Shift_JIS（日文）</option>
+                  </select>
+                </div>
+                <button class="btn btn-primary" id="btn-zipfix-run" style="align-self:flex-end;">🔧 修复 ZIP</button>
+              </div>
+              <div id="zipfix-result"></div>
+            </div>
+
+            <div class="card" style="margin:0; box-shadow:none;">
+              <h3>📝 文本 / CSV 编码乱码修复</h3>
+              <p style="font-size:12px;color:var(--muted);margin:-6px 0 10px;">解决 TXT / CSV / 字幕乱码；Excel 打开 CSV 乱码推荐转「UTF-8 带 BOM」</p>
+              <div class="dropzone" id="txtfix-drop" style="padding:16px 12px;">
+                <div class="dropzone-sub" style="margin-bottom:8px;">拖入 TXT / CSV / 日志等文本文件</div>
+                <div class="dropzone-actions">
+                  <button class="btn btn-primary btn-sm" id="btn-txtfix-pick">📁 选择文本文件</button>
+                  <button class="btn btn-sm btn-danger" id="btn-txtfix-clear" style="display:none;">🗑️ 移除</button>
+                </div>
+              </div>
+              <div id="txtfix-meta" class="meta" style="margin:8px 0;font-size:12px;"></div>
+              <div class="grid-2" style="margin-bottom:10px;">
+                <div class="field">
+                  <label>原文件编码</label>
+                  <select id="txtfix-src">
+                    <option value="auto" selected>自动检测</option>
+                    <option value="gb18030">GBK / GB18030</option>
+                    <option value="utf-8">UTF-8</option>
+                    <option value="utf-16">UTF-16</option>
+                    <option value="big5">Big5</option>
+                  </select>
+                </div>
+                <div class="field">
+                  <label>输出编码</label>
+                  <select id="txtfix-dst">
+                    <option value="utf-8-sig" selected>UTF-8 带 BOM（Excel 打开 CSV 不乱码）</option>
+                    <option value="utf-8">标准 UTF-8（无 BOM，通用）</option>
+                    <option value="gb18030">GB18030（兼容旧版软件）</option>
+                  </select>
+                </div>
+              </div>
+              <button class="btn btn-primary" id="btn-txtfix-run">🔧 修复并导出</button>
+              <div id="txtfix-result"></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="subpanel" id="t-hash">
+          <div class="dropzone" id="hash-drop" style="padding:18px 14px;">
+            <div class="dropzone-title">拖入或选择本机任意文件计算校验值</div>
+            <div class="dropzone-sub">流式分块计算 MD5 / SHA1 / SHA256 / CRC32，GB 级大文件推荐点「选本机文件」零拷贝直算</div>
+            <div class="dropzone-actions">
+              <button class="btn btn-primary btn-sm" id="btn-hash-pick">📁 选本机文件</button>
+              <button class="btn btn-sm" id="btn-hash-clear">清空</button>
+            </div>
+          </div>
+          <div id="hash-meta" class="meta" style="margin:8px 0;font-size:12px;"></div>
+          <div id="hash-values" class="file-list"></div>
+          <div class="field" style="margin-top:12px;">
+            <label>粘贴官方校验值自动比对（自动匹配 MD5 / SHA1 / SHA256 / CRC32，忽略大小写与空格）</label>
+            <input type="text" id="hash-expect" placeholder="粘贴下载页提供的 MD5 或 SHA256 哈希值…">
+          </div>
+          <div id="hash-compare-out"></div>
         </div>
       </div>
     </section>
@@ -503,13 +816,21 @@
 
         <div class="subpanel active" id="c-loan">
           <div class="grid-3" style="margin-bottom:12px;">
-            <div class="field"><label>贷款总额（万元）</label><input type="number" id="ln-amount" value="100" step="1"></div>
-            <div class="field"><label>年利率（%）</label><input type="number" id="ln-rate" value="3.3" step="0.05"></div>
+            <div class="field">
+              <label>还款方式</label>
+              <select id="ln-type">
+                <option value="equal_payment" selected>等额本息（每月固定月供）</option>
+                <option value="equal_principal">等额本金（每月递减，总利息更少）</option>
+              </select>
+            </div>
+            <div class="field"><label>贷款总额（万元）</label><input type="number" id="ln-amount" value="100" step="1" min="0"></div>
+            <div class="field"><label>年利率（%）</label><input type="number" id="ln-rate" value="3.3" step="0.05" min="0"></div>
             <div class="field"><label>贷款年限（年）</label><input type="number" id="ln-years" value="30" min="1" max="40"></div>
-            <div class="field"><label>计划提前还款金额（万元，0为不提前）</label><input type="number" id="ln-prepay" value="20" step="1"></div>
+            <div class="field"><label>计划提前还款金额（万元，0为不提前）</label><input type="number" id="ln-prepay" value="20" step="1" min="0"></div>
             <div class="field"><label>第几年提前还</label><input type="number" id="ln-preyear" value="3" min="1" max="39"></div>
           </div>
           <div class="info-grid" id="ln-out"></div>
+          <div id="ln-compare"></div>
         </div>
 
         <div class="subpanel" id="c-compound">

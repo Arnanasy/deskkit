@@ -11,16 +11,22 @@ from urllib.parse import parse_qs, quote, unquote, urlparse
 import uuid
 
 from tools_files import (
-    OUTPUT_DIR, UPLOAD_DIR, UPLOAD_PREFIX, cleanup_old_uploads, ensure_dirs,
-    execute_batch_rename, is_within, open_in_explorer, pick_files, pick_folder,
-    preview_batch_rename, safe_filename,
+    OUTPUT_DIR, UPLOAD_DIR, UPLOAD_PREFIX, calc_file_hash, cleanup_old_uploads,
+    ensure_dirs, execute_batch_rename, fix_text_encoding, fix_zip_encoding,
+    is_within, open_in_explorer, pick_files, pick_folder, preview_batch_rename,
+    safe_filename,
 )
-from tools_image import process_convert_compress, stitch_images
+from tools_image import (
+    process_convert_compress, rotate_flip_images, split_image, stitch_images,
+)
 from tools_pdf import (
     compress_pdf, edit_pages, images_to_pdf, merge_pdfs, pdf_info,
-    pdf_to_images, pdf_to_word, word_to_pdf,
+    pdf_to_images, pdf_to_word, protect_pdf, unlock_pdf, word_to_pdf,
 )
-from tools_video import ffmpeg_bins, has_nvenc, probe_video, video_tasks
+from tools_video import (
+    convert_subtitle, export_video_frames, ffmpeg_bins, has_nvenc, probe_video,
+    video_tasks,
+)
 
 APP_DIR = Path(__file__).resolve().parent
 WEB_DIR = APP_DIR / 'web'
@@ -140,6 +146,8 @@ class ToolboxHandler(BaseHTTPRequestHandler):
         ctype, _ = mimetypes.guess_type(str(target))
         if target.suffix.lower() == '.webp':
             ctype = 'image/webp'
+        elif target.suffix.lower() == '.avif':
+            ctype = 'image/avif'
         ctype = ctype or 'application/octet-stream'
 
         range_hdr = self.headers.get('Range')
@@ -382,6 +390,32 @@ class ToolboxHandler(BaseHTTPRequestHandler):
                 self._send_json({'ok': ok})
                 return
 
+            if path == '/api/video/merge':
+                task = video_tasks.start_merge(data.get('paths', []), data.get('options') or {})
+                self._send_json(task)
+                return
+
+            if path == '/api/video/frames':
+                res = export_video_frames(
+                    path_str=data['path'],
+                    mode=data.get('mode', 'interval'),
+                    interval=data.get('interval', 2.0),
+                    count=data.get('count', 10),
+                    fmt=data.get('format', 'jpg'),
+                    start=data.get('start', ''),
+                    end=data.get('end', ''),
+                )
+                self._send_json(res)
+                return
+
+            if path == '/api/video/subtitle':
+                res = convert_subtitle(
+                    path_str=data['path'],
+                    target_fmt=data.get('format', 'srt'),
+                )
+                self._send_json(res)
+                return
+
             # ---- 图片工坊 ----
             if path == '/api/image/process':
                 res = process_convert_compress(
@@ -402,6 +436,28 @@ class ToolboxHandler(BaseHTTPRequestHandler):
                     gap=data.get('gap', 0),
                     bg_color=data.get('bg_color', '#ffffff'),
                     cols=data.get('cols', 2),
+                    out_fmt=data.get('format', 'png'),
+                )
+                self._send_json(res)
+                return
+
+            if path == '/api/image/rotate':
+                res = rotate_flip_images(
+                    paths=data.get('paths', []),
+                    op=data.get('op', 'cw90'),
+                    out_fmt=data.get('format', 'keep'),
+                )
+                self._send_json(res)
+                return
+
+            if path == '/api/image/split':
+                res = split_image(
+                    path_str=data['path'],
+                    mode=data.get('mode', 'vertical'),
+                    parts=data.get('parts', 3),
+                    rows=data.get('rows', 3),
+                    cols=data.get('cols', 3),
+                    max_piece_height=data.get('max_piece_height', 0),
                     out_fmt=data.get('format', 'png'),
                 )
                 self._send_json(res)
@@ -450,6 +506,43 @@ class ToolboxHandler(BaseHTTPRequestHandler):
                 self._send_json(word_to_pdf(data['path']))
                 return
 
+            if path == '/api/pdf/protect':
+                self._send_json(protect_pdf(
+                    path_str=data['path'],
+                    user_pw=data.get('user_pw', ''),
+                    owner_pw=data.get('owner_pw', ''),
+                    allow_print=bool(data.get('allow_print', True)),
+                    allow_copy=bool(data.get('allow_copy', True)),
+                ))
+                return
+
+            if path == '/api/pdf/unlock':
+                self._send_json(unlock_pdf(
+                    path_str=data['path'],
+                    password=data.get('password', ''),
+                ))
+                return
+
+            # ---- 编码修复 / ZIP 修复 / 文件哈希 ----
+            if path == '/api/file/zip-fix':
+                self._send_json(fix_zip_encoding(
+                    path_str=data['path'],
+                    source_encoding=data.get('source_encoding', 'auto'),
+                ))
+                return
+
+            if path == '/api/file/text-fix':
+                self._send_json(fix_text_encoding(
+                    path_str=data['path'],
+                    source_encoding=data.get('source_encoding', 'auto'),
+                    target_encoding=data.get('target_encoding', 'utf-8'),
+                ))
+                return
+
+            if path == '/api/file/hash':
+                self._send_json(calc_file_hash(data['path']))
+                return
+
             # ---- 批量重命名 ----
             if path == '/api/rename/preview':
                 res = preview_batch_rename(
@@ -464,6 +557,7 @@ class ToolboxHandler(BaseHTTPRequestHandler):
                     pad_digits=int(data.get('pad_digits') or 2),
                     ext_filter=data.get('ext_filter', ''),
                     new_ext=data.get('new_ext', ''),
+                    ext_case=data.get('ext_case', ''),
                 )
                 self._send_json(res)
                 return

@@ -1,4 +1,5 @@
-"""本机文件与目录管理：输出目录、临时上传、系统文件弹窗、打开目录、批量重命名。"""
+"""本机文件与目录管理：输出目录、临时上传、系统文件弹窗、打开目录、批量重命名、ZIP/文本乱码修复、文件哈希校验。"""
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -9,6 +10,8 @@ import sys
 import tempfile
 import time
 import uuid
+import zipfile
+import zlib
 
 OUTPUT_DIR = Path.home() / 'Downloads' / '工具箱输出'
 UPLOAD_DIR = Path(tempfile.gettempdir()) / 'local_toolbox_uploads'
@@ -169,7 +172,7 @@ def pick_folder(title='选择文件夹'):
 
 def preview_batch_rename(folder, find_text='', replace_text='', prefix='', suffix='',
                          use_regex=False, numbering=False, start_num=1, pad_digits=2,
-                         ext_filter='', new_ext=''):
+                         ext_filter='', new_ext='', ext_case=''):
     """预览文件夹内文件的批量重命名结果，并检查重名冲突。"""
     base = Path(folder)
     if not base.exists() or not base.is_dir():
@@ -211,6 +214,10 @@ def preview_batch_rename(folder, find_text='', replace_text='', prefix='', suffi
             stem = f'{stem}_{num_str}' if stem else num_str
         if new_ext.strip():
             ext = '.' + new_ext.strip().lstrip('.')
+        if ext_case == 'lower':
+            ext = ext.lower()
+        elif ext_case == 'upper':
+            ext = ext.upper()
         new_name = safe_filename(stem) + ext
         changed = new_name != f.name
         key = new_name.lower()
@@ -300,3 +307,190 @@ def execute_batch_rename(folder, items):
                 pass
         raise
     return {'renamed': len(done_map)}
+
+
+def _sanitize_zip_entry_name(name):
+    """清洗 ZIP 条目相对路径，剥离前导斜杠与 .. 段，防御 Zip Slip。"""
+    normalized = name.replace('\\', '/')
+    is_dir = normalized.endswith('/')
+    parts = [p for p in normalized.split('/') if p and p not in ('.', '..')]
+    if not parts:
+        return ''
+    safe_parts = [safe_filename(p) for p in parts]
+    result = '/'.join(safe_parts)
+    return result + ('/' if is_dir else '')
+
+
+def fix_zip_encoding(path_str, source_encoding='auto', out_dir=None):
+    """修复 ZIP 压缩包内中文文件名乱码，并重新打包为标准 UTF-8 ZIP。"""
+    src = Path(path_str)
+    if not src.exists():
+        raise FileNotFoundError('ZIP 文件不存在')
+    if not zipfile.is_zipfile(src):
+        raise ValueError('该文件不是有效的 ZIP 压缩包')
+
+    out_dir = Path(out_dir or OUTPUT_DIR)
+    out_path = unique_path(out_dir, f'{clean_stem(src)}_修复中文', '.zip')
+
+    candidates = (
+        ['utf-8', 'gb18030', 'big5', 'shift_jis']
+        if source_encoding == 'auto'
+        else [source_encoding]
+    )
+
+    fixed_count = 0
+    total_count = 0
+    preview_items = []
+    seen_names = set()
+
+    with zipfile.ZipFile(src, 'r') as zin, zipfile.ZipFile(out_path, 'w', compression=zipfile.ZIP_DEFLATED) as zout:
+        for info in zin.infolist():
+            total_count += 1
+            orig_name = info.filename
+            new_name = orig_name
+            if not (info.flag_bits & 0x800):
+                try:
+                    raw_bytes = orig_name.encode('cp437')
+                except UnicodeEncodeError:
+                    raw_bytes = None
+                if raw_bytes is not None:
+                    for enc in candidates:
+                        try:
+                            decoded = raw_bytes.decode(enc)
+                            new_name = decoded
+                            break
+                        except UnicodeDecodeError:
+                            continue
+
+            clean_name = _sanitize_zip_entry_name(new_name)
+            if not clean_name:
+                continue
+            # 防止重名覆盖
+            if clean_name in seen_names:
+                p_obj = Path(clean_name.rstrip('/'))
+                suffix = '/' if clean_name.endswith('/') else p_obj.suffix
+                stem = p_obj.name if clean_name.endswith('/') else p_obj.stem
+                parent = str(p_obj.parent).replace('\\', '/')
+                idx = 2
+                while True:
+                    cand = f'{stem}_{idx}{suffix}'
+                    cand = f'{parent}/{cand}' if parent and parent != '.' else cand
+                    if cand not in seen_names:
+                        clean_name = cand
+                        break
+                    idx += 1
+            seen_names.add(clean_name)
+
+            changed = (clean_name != orig_name)
+            if changed:
+                fixed_count += 1
+            if len(preview_items) < 30:
+                preview_items.append({'old': orig_name, 'new': clean_name, 'changed': changed})
+
+            new_info = zipfile.ZipInfo(filename=clean_name, date_time=info.date_time)
+            new_info.external_attr = info.external_attr
+            if clean_name.endswith('/'):
+                zout.writestr(new_info, b'')
+            else:
+                zout.writestr(new_info, zin.read(info.filename), compress_type=zipfile.ZIP_DEFLATED)
+
+    return {
+        'name': out_path.name,
+        'path': str(out_path),
+        'total': total_count,
+        'fixed': fixed_count,
+        'items': preview_items,
+        'output_size': out_path.stat().st_size,
+        'output_dir': str(out_dir),
+    }
+
+
+def fix_text_encoding(path_str, source_encoding='auto', target_encoding='utf-8', out_dir=None):
+    """自动识别并修复文本/CSV/字幕等文件的编码乱码（支持输出标准 UTF-8 或 Excel 友好的 UTF-8 BOM）。"""
+    src = Path(path_str)
+    if not src.exists():
+        raise FileNotFoundError('文件不存在')
+    size = src.stat().st_size
+    if size > 50 * 1024 * 1024:
+        raise ValueError('文本文件超过 50MB 上限，请确认选择的是纯文本/CSV 文件')
+
+    allowed_targets = {'utf-8', 'utf-8-sig', 'gb18030'}
+    if target_encoding not in allowed_targets:
+        raise ValueError(f'不支持的目标编码: {target_encoding}')
+
+    raw = src.read_bytes()
+    detected = source_encoding
+    text = None
+
+    if source_encoding == 'auto':
+        if raw.startswith(b'\xef\xbb\xbf'):
+            detected, text = 'utf-8-sig', raw.decode('utf-8-sig')
+        elif raw.startswith((b'\xff\xfe', b'\xfe\xff')):
+            detected, text = 'utf-16', raw.decode('utf-16')
+        else:
+            for enc in ('utf-8', 'gb18030', 'big5', 'shift_jis'):
+                try:
+                    text = raw.decode(enc)
+                    detected = enc
+                    break
+                except UnicodeDecodeError:
+                    continue
+            if text is None:
+                detected = 'latin1'
+                text = raw.decode('latin1')
+    else:
+        try:
+            text = raw.decode(source_encoding)
+        except LookupError:
+            raise ValueError(f'不支持的源编码: {source_encoding}')
+        except UnicodeDecodeError as err:
+            raise ValueError(f'使用 {source_encoding} 解码失败: {err}')
+
+    out_dir = Path(out_dir or OUTPUT_DIR)
+    ext = src.suffix or '.txt'
+    tag = 'UTF8BOM' if target_encoding == 'utf-8-sig' else target_encoding.upper().replace('-', '')
+    out_path = unique_path(out_dir, f'{clean_stem(src)}_{tag}', ext)
+    out_bytes = text.encode(target_encoding, errors='replace')
+    out_path.write_bytes(out_bytes)
+
+    preview_lines = text.splitlines()[:6]
+    return {
+        'name': out_path.name,
+        'path': str(out_path),
+        'detected_encoding': detected,
+        'target_encoding': target_encoding,
+        'preview': '\n'.join(preview_lines)[:600],
+        'output_size': out_path.stat().st_size,
+        'output_dir': str(out_dir),
+    }
+
+
+def calc_file_hash(path_str):
+    """流式分块计算任意文件的 MD5、SHA1、SHA256 与 CRC32（大文件不占内存）。"""
+    src = Path(path_str)
+    if not src.exists() or not src.is_file():
+        raise FileNotFoundError('文件不存在')
+    md5 = hashlib.md5()
+    sha1 = hashlib.sha1()
+    sha256 = hashlib.sha256()
+    crc = 0
+    total = 0
+    with open(src, 'rb') as f:
+        while True:
+            chunk = f.read(1024 * 1024)
+            if not chunk:
+                break
+            md5.update(chunk)
+            sha1.update(chunk)
+            sha256.update(chunk)
+            crc = zlib.crc32(chunk, crc)
+            total += len(chunk)
+    return {
+        'name': clean_stem(src) + src.suffix,
+        'path': str(src),
+        'size_bytes': total,
+        'md5': md5.hexdigest(),
+        'sha1': sha1.hexdigest(),
+        'sha256': sha256.hexdigest(),
+        'crc32': f'{crc & 0xffffffff:08x}',
+    }

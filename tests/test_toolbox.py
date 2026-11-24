@@ -1,15 +1,22 @@
-"""本地工具箱核心逻辑单元测试（纯标准库，不触碰真实用户文件、FFmpeg 或 Word）。"""
+"""本地工具箱核心逻辑单元测试（覆盖文件、图片、PDF、视频与字幕、编码修复与哈希校验）。"""
+import hashlib
 from pathlib import Path
 import sys
 import tempfile
 import unittest
 from unittest import mock
+import zipfile
+import zlib
+
+from PIL import Image, features
+import pymupdf
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 if str(PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR))
 
 import tools_files
+import tools_image
 import tools_pdf
 import tools_video
 
@@ -94,9 +101,164 @@ class TestToolsFiles(unittest.TestCase):
             self.assertFalse((base / 'x.txt').exists())
             self.assertEqual(sorted(p.name for p in base.iterdir()), ['a.txt', 'b.txt', 'c.txt'])
 
+    def test_preview_batch_rename_ext_case(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / 'Photo.JPG').write_text('x', encoding='utf-8')
+            res_low = tools_files.preview_batch_rename(tmp, ext_case='lower')
+            self.assertEqual(res_low['items'][0]['new_name'], 'Photo.jpg')
+            res_up = tools_files.preview_batch_rename(tmp, ext_case='upper')
+            self.assertEqual(res_up['items'][0]['new_name'], 'Photo.JPG')
+
+    def test_fix_zip_encoding_restores_gbk_chinese_and_sanitizes_zip_slip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp) / '中文目录'
+            base.mkdir()
+            src_zip = base / '乱码包.zip'
+            out_dir = base / '输出'
+
+            # 模拟旧版 Windows 打包：以 GB18030 原始字节写入文件名且 flag_bits 不置 UTF-8 (0x800)
+            gbk_name_bytes = '文档目录/测试中文.txt'.encode('gb18030')
+
+            class RawZipInfo(zipfile.ZipInfo):
+                def _encodeFilenameFlags(self):
+                    return gbk_name_bytes, 0
+
+            with zipfile.ZipFile(src_zip, 'w') as zf:
+                zi1 = RawZipInfo('placeholder.txt')
+                zf.writestr(zi1, '你好，世界！'.encode('utf-8'))
+                zi2 = zipfile.ZipInfo('../越界文件.txt')
+                zf.writestr(zi2, b'safe')
+
+            res = tools_files.fix_zip_encoding(str(src_zip), source_encoding='auto', out_dir=out_dir)
+            self.assertGreaterEqual(res['fixed'], 1)
+            fixed_zip = Path(res['path'])
+            self.assertTrue(fixed_zip.exists())
+            with zipfile.ZipFile(fixed_zip, 'r') as zf:
+                names = zf.namelist()
+                self.assertIn('文档目录/测试中文.txt', names)
+                self.assertIn('越界文件.txt', names)
+                self.assertFalse(any('..' in n for n in names))
+                self.assertEqual(zf.read('文档目录/测试中文.txt').decode('utf-8'), '你好，世界！')
+
+            # 非 ZIP 文件应抛出 ValueError
+            bad_file = base / 'not_zip.txt'
+            bad_file.write_text('hello', encoding='utf-8')
+            with self.assertRaises(ValueError):
+                tools_files.fix_zip_encoding(str(bad_file), out_dir=out_dir)
+
+    def test_fix_text_encoding_gbk_to_utf8_bom_and_errors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp) / '中文路径'
+            base.mkdir()
+            csv_path = base / '报表.csv'
+            content = '姓名,城市\n张三,北京\n李四,上海\n'
+            csv_path.write_bytes(content.encode('gb18030'))
+
+            res = tools_files.fix_text_encoding(str(csv_path), source_encoding='auto',
+                                                target_encoding='utf-8-sig', out_dir=base)
+            self.assertEqual(res['detected_encoding'], 'gb18030')
+            out_bytes = Path(res['path']).read_bytes()
+            self.assertTrue(out_bytes.startswith(b'\xef\xbb\xbf'))
+            self.assertEqual(out_bytes.decode('utf-8-sig'), content)
+
+            with self.assertRaises(ValueError):
+                tools_files.fix_text_encoding(str(csv_path), target_encoding='invalid-enc', out_dir=base)
+
+    def test_calc_file_hash_normal_and_empty_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp) / '哈希测试'
+            base.mkdir()
+            f1 = base / '样本文件.bin'
+            payload = '本地工具箱校验测试 123456'.encode('utf-8')
+            f1.write_bytes(payload)
+            res = tools_files.calc_file_hash(str(f1))
+            self.assertEqual(res['md5'], hashlib.md5(payload).hexdigest())
+            self.assertEqual(res['sha1'], hashlib.sha1(payload).hexdigest())
+            self.assertEqual(res['sha256'], hashlib.sha256(payload).hexdigest())
+            self.assertEqual(res['crc32'], f'{zlib.crc32(payload) & 0xffffffff:08x}')
+
+            # 空文件边界
+            f0 = base / 'empty.dat'
+            f0.write_bytes(b'')
+            res0 = tools_files.calc_file_hash(str(f0))
+            self.assertEqual(res0['size_bytes'], 0)
+            self.assertEqual(res0['md5'], hashlib.md5(b'').hexdigest())
+            self.assertEqual(res0['crc32'], '00000000')
+
+
+class TestToolsImage(unittest.TestCase):
+    """图片工坊：透明通道+保留EXIF转JPG回归测试、AVIF支持、旋转翻转、长图分割。"""
+
+    def test_rgba_with_exif_to_jpg_when_keep_exif_does_not_crash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp) / '中文图库'
+            base.mkdir()
+            png_path = base / '透明带EXIF.png'
+            img = Image.new('RGBA', (40, 30), (255, 0, 0, 128))
+            exif = Image.Exif()
+            exif[0x010F] = 'TestCamera'
+            img.save(png_path, format='PNG', exif=exif.tobytes())
+
+            # strip_exif=False 且 RGBA -> JPG 之前会绕过白底转换报错，现应成功并输出 RGB JPEG
+            res = tools_image.process_convert_compress(
+                [str(png_path)], target_fmt='jpg', quality=85, strip_exif=False, out_dir=base
+            )
+            out_path = Path(res['files'][0]['path'])
+            self.assertTrue(out_path.exists())
+            with Image.open(out_path) as out_img:
+                self.assertEqual(out_img.format, 'JPEG')
+                self.assertEqual(out_img.mode, 'RGB')
+
+    def test_avif_roundtrip_if_supported(self):
+        if not features.check('avif'):
+            self.skipTest('当前 Pillow 未启用 AVIF')
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            src = base / 'sample.png'
+            Image.new('RGB', (32, 24), (10, 120, 220)).save(src)
+            res = tools_image.process_convert_compress([str(src)], target_fmt='avif', out_dir=base)
+            avif_path = Path(res['files'][0]['path'])
+            self.assertEqual(avif_path.suffix.lower(), '.avif')
+            # 再把 AVIF 转回 PNG
+            res2 = tools_image.process_convert_compress([str(avif_path)], target_fmt='png', out_dir=base)
+            self.assertTrue(Path(res2['files'][0]['path']).exists())
+
+    def test_rotate_flip_and_split_image(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp) / '图片目录'
+            base.mkdir()
+            src = base / '长图测试.png'
+            Image.new('RGB', (60, 120), (30, 144, 255)).save(src)
+
+            # 旋转 90° 后宽高应互换
+            rot = tools_image.rotate_flip_images([str(src)], op='cw90', out_dir=base)
+            self.assertEqual(rot['files'][0]['width'], 120)
+            self.assertEqual(rot['files'][0]['height'], 60)
+
+            # 空列表报错
+            with self.assertRaises(ValueError):
+                tools_image.rotate_flip_images([], op='cw90', out_dir=base)
+
+            # 竖向按份数切分 3 份
+            sp1 = tools_image.split_image(str(src), mode='vertical', parts=3, out_dir=base)
+            self.assertEqual(sp1['count'], 3)
+            self.assertTrue(Path(sp1['zip_path']).exists())
+
+            # 按单段最大高度切分（120 / 50 -> 3 张）
+            sp2 = tools_image.split_image(str(src), mode='vertical', max_piece_height=50, out_dir=base)
+            self.assertEqual(sp2['count'], 3)
+
+            # 九宫格切图（3x3 -> 9 张）
+            sp3 = tools_image.split_image(str(src), mode='grid', rows=3, cols=3, out_dir=base)
+            self.assertEqual(sp3['count'], 9)
+
+            # 单段高度 >= 原图高度应报错
+            with self.assertRaises(ValueError):
+                tools_image.split_image(str(src), mode='vertical', max_piece_height=200, out_dir=base)
+
 
 class TestToolsPdf(unittest.TestCase):
-    """PDF 页码解析表达式边界。"""
+    """PDF 页码解析表达式边界与 AES-256 加密/解锁。"""
 
     def test_parse_pages_ranges_order_dedup_and_bounds(self):
         self.assertEqual(tools_pdf.parse_pages('', 5), [0, 1, 2, 3, 4])
@@ -104,9 +266,42 @@ class TestToolsPdf(unittest.TestCase):
         # 支持倒序区间
         self.assertEqual(tools_pdf.parse_pages('4-2', 5), [3, 2, 1])
 
+    def test_protect_and_unlock_pdf(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp) / '文档测试'
+            base.mkdir()
+            src = base / '合同样本.pdf'
+            doc = pymupdf.open()
+            page = doc.new_page()
+            page.insert_text((72, 72), 'Hello Local Toolbox')
+            doc.save(src)
+            doc.close()
+
+            # 两个密码均空应报错
+            with self.assertRaises(ValueError):
+                tools_pdf.protect_pdf(str(src), user_pw='', owner_pw='', out_dir=base)
+
+            # 设置打开密码加密
+            enc = tools_pdf.protect_pdf(str(src), user_pw='secret123', allow_print=False, allow_copy=False, out_dir=base)
+            enc_path = enc['path']
+            info = tools_pdf.pdf_info(enc_path)
+            self.assertTrue(info['needs_pass'])
+            self.assertTrue(info['is_encrypted'])
+
+            # 错误密码解锁失败
+            with self.assertRaises(ValueError):
+                tools_pdf.unlock_pdf(enc_path, password='wrong', out_dir=base)
+
+            # 正确密码解锁成功
+            dec = tools_pdf.unlock_pdf(enc_path, password='secret123', out_dir=base)
+            dec_info = tools_pdf.pdf_info(dec['path'])
+            self.assertFalse(dec_info['needs_pass'])
+            self.assertFalse(dec_info['is_encrypted'])
+            self.assertEqual(dec_info['pages'], 1)
+
 
 class TestToolsVideo(unittest.TestCase):
-    """时间解析与视频任务并发上限。"""
+    """时间解析、视频任务并发上限、旋转指令构建与字幕互转。"""
 
     def test_time_to_seconds_formats(self):
         self.assertEqual(tools_video._time_to_seconds(''), 0.0)
@@ -122,6 +317,59 @@ class TestToolsVideo(unittest.TestCase):
             with self.assertRaises(RuntimeError) as ctx:
                 mgr.start('dummy.mp4', 'compat')
             self.assertIn('正在处理中', str(ctx.exception))
+
+    def test_video_rotate_command_and_merge_validation(self):
+        mgr = tools_video.VideoTaskManager()
+        fake_info = {
+            'duration': 10.0, 'can_remux_video': True, 'can_remux_audio': True,
+            'audio_codec': 'aac', 'size_bytes': 1024,
+        }
+        with mock.patch.object(tools_video, 'has_nvenc', return_value=False):
+            cmd, out_path, desc, dur = mgr._build_command(
+                'ffmpeg', Path('demo.mp4'), fake_info, 'rotate',
+                {'rotate_op': 'cw90', 'use_nvenc': False}, Path(tempfile.gettempdir())
+            )
+            self.assertIn('transpose=1,format=yuv420p', cmd)
+            self.assertIn('顺时针90°', desc)
+            self.assertEqual(dur, 10.0)
+
+        with self.assertRaises(ValueError):
+            mgr.start_merge(['only_one.mp4'])
+
+    def test_subtitle_roundtrip_srt_vtt_ass_with_gbk(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp) / '字幕测试'
+            base.mkdir()
+            srt_path = base / '示例字幕.srt'
+            srt_content = (
+                '1\n00:00:01,200 --> 00:00:03,500\n你好，本地工具箱\n第二行字幕\n\n'
+                '2\n00:00:04,000 --> 00:00:06,250\n测试完成\n'
+            )
+            # 用 GB18030 写入以测试自动编码识别
+            srt_path.write_bytes(srt_content.encode('gb18030'))
+
+            vtt = tools_video.convert_subtitle(str(srt_path), target_fmt='vtt', out_dir=base)
+            self.assertEqual(vtt['cues'], 2)
+            self.assertEqual(vtt['detected_encoding'], 'gb18030')
+            vtt_txt = Path(vtt['path']).read_text(encoding='utf-8')
+            self.assertTrue(vtt_txt.startswith('WEBVTT'))
+            self.assertIn('00:00:01.200 --> 00:00:03.500', vtt_txt)
+
+            ass = tools_video.convert_subtitle(vtt['path'], target_fmt='ass', out_dir=base)
+            self.assertEqual(ass['cues'], 2)
+            ass_txt = Path(ass['path']).read_text(encoding='utf-8')
+            self.assertIn('Dialogue: 0,0:00:01.20,0:00:03.50,Default,,0,0,0,,你好，本地工具箱\\N第二行字幕', ass_txt)
+
+            back_srt = tools_video.convert_subtitle(ass['path'], target_fmt='srt', out_dir=base)
+            self.assertEqual(back_srt['cues'], 2)
+            back_txt = Path(back_srt['path']).read_text(encoding='utf-8')
+            self.assertIn('你好，本地工具箱\n第二行字幕', back_txt)
+
+            # 空字幕文件应报错
+            empty_sub = base / 'empty.srt'
+            empty_sub.write_text('', encoding='utf-8')
+            with self.assertRaises(ValueError):
+                tools_video.convert_subtitle(str(empty_sub), target_fmt='vtt', out_dir=base)
 
 
 if __name__ == '__main__':
