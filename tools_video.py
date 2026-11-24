@@ -152,6 +152,7 @@ class VideoTaskManager:
     """后台执行 FFmpeg 转码任务，通过 -progress 管道提供实时百分比进度、取消与回收能力。"""
 
     MAX_HISTORY = 50
+    MAX_CONCURRENT = 1
 
     def __init__(self):
         self._tasks = {}
@@ -206,6 +207,10 @@ class VideoTaskManager:
         ffmpeg, _ = ffmpeg_bins()
         if not ffmpeg:
             raise RuntimeError('未找到 ffmpeg，请确认已安装 FFmpeg')
+        with self._lock:
+            running = sum(1 for t in self._tasks.values() if t.get('status') == 'running')
+            if running >= self.MAX_CONCURRENT:
+                raise RuntimeError('已有视频任务正在处理中，请等待完成或先取消当前任务')
         options = options or {}
         info = probe_video(path_str)
         src = Path(path_str)
@@ -229,6 +234,9 @@ class VideoTaskManager:
             '_proc': None,
         }
         with self._lock:
+            running = sum(1 for t in self._tasks.values() if t.get('status') == 'running')
+            if running >= self.MAX_CONCURRENT:
+                raise RuntimeError('已有视频任务正在处理中，请等待完成或先取消当前任务')
             self._prune_locked()
             self._tasks[task_id] = task
 

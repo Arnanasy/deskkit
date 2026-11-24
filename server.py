@@ -27,6 +27,8 @@ WEB_DIR = APP_DIR / 'web'
 DEFAULT_PORT = 18642
 PORT_SPAN = 20
 MAX_UPLOAD_BYTES = 4 * 1024 * 1024 * 1024  # 单文件上传上限 4GB
+SOCKET_TIMEOUT = 60                        # 单次读写空闲超时（秒），防慢速连接挂死线程
+_THUMB_SEM = threading.Semaphore(2)        # 限制同时拉起的缩略图 FFmpeg 并发数
 CSP_HEADER = (
     "default-src 'self'; style-src 'self' 'unsafe-inline'; "
     "img-src 'self' data: blob:; media-src 'self' blob:; frame-src 'self'"
@@ -44,6 +46,10 @@ if not log.handlers:
 
 class ToolboxHandler(BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
+
+    def setup(self):
+        super().setup()
+        self.request.settimeout(SOCKET_TIMEOUT)
 
     def log_message(self, fmt, *args):
         # 静默常规访问日志，避免 pythonw 无控制台时异常
@@ -157,6 +163,8 @@ class ToolboxHandler(BaseHTTPRequestHandler):
         length = max(0, end - start + 1) if size > 0 else 0
         self.send_response(status)
         self.send_header('Content-Type', ctype)
+        self.send_header('X-Content-Type-Options', 'nosniff')
+        self.send_header('Content-Security-Policy', 'sandbox')
         self.send_header('Accept-Ranges', 'bytes')
         self.send_header('Content-Length', str(length))
         if status == 206 and size > 0:
@@ -190,25 +198,32 @@ class ToolboxHandler(BaseHTTPRequestHandler):
             self._send_json({'error': '未找到 ffmpeg'}, 500)
             return
         no_win = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
-        run = subprocess.run(
-            [ffmpeg, '-hide_banner', '-loglevel', 'error', '-ss', '00:00:01', '-i', str(target),
-             '-frames:v', '1', '-vf', 'scale=480:-2', '-f', 'image2pipe', '-vcodec', 'mjpeg', 'pipe:1'],
-            capture_output=True, timeout=8, creationflags=no_win,
-        )
-        data = run.stdout
-        if not data:
-            # 短视频不足 1 秒时回退取第 0 秒首帧
+        if not _THUMB_SEM.acquire(timeout=10):
+            self._send_json({'error': '缩略图生成繁忙，请稍后重试'}, 429)
+            return
+        try:
             run = subprocess.run(
-                [ffmpeg, '-hide_banner', '-loglevel', 'error', '-i', str(target),
+                [ffmpeg, '-hide_banner', '-loglevel', 'error', '-ss', '00:00:01', '-i', str(target),
                  '-frames:v', '1', '-vf', 'scale=480:-2', '-f', 'image2pipe', '-vcodec', 'mjpeg', 'pipe:1'],
                 capture_output=True, timeout=8, creationflags=no_win,
             )
             data = run.stdout
+            if not data:
+                # 短视频不足 1 秒时回退取第 0 秒首帧
+                run = subprocess.run(
+                    [ffmpeg, '-hide_banner', '-loglevel', 'error', '-i', str(target),
+                     '-frames:v', '1', '-vf', 'scale=480:-2', '-f', 'image2pipe', '-vcodec', 'mjpeg', 'pipe:1'],
+                    capture_output=True, timeout=8, creationflags=no_win,
+                )
+                data = run.stdout
+        finally:
+            _THUMB_SEM.release()
         if not data:
             self._send_json({'error': '无法生成缩略图'}, 404)
             return
         self.send_response(200)
         self.send_header('Content-Type', 'image/jpeg')
+        self.send_header('X-Content-Type-Options', 'nosniff')
         self.send_header('Content-Length', str(len(data)))
         self.send_header('Cache-Control', 'no-store')
         self.end_headers()
@@ -223,6 +238,7 @@ class ToolboxHandler(BaseHTTPRequestHandler):
         ctype, _ = mimetypes.guess_type(str(target))
         self.send_response(200)
         self.send_header('Content-Type', ctype or 'application/octet-stream')
+        self.send_header('X-Content-Type-Options', 'nosniff')
         self.send_header('Content-Length', str(size))
         encoded_name = quote(target.name)
         self.send_header('Content-Disposition', f"attachment; filename*=UTF-8''{encoded_name}")
@@ -232,7 +248,10 @@ class ToolboxHandler(BaseHTTPRequestHandler):
                 chunk = f.read(262144)
                 if not chunk:
                     break
-                self.wfile.write(chunk)
+                try:
+                    self.wfile.write(chunk)
+                except OSError:
+                    break
 
     def do_GET(self):
         if not self._check_host():

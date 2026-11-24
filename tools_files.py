@@ -46,10 +46,21 @@ def cleanup_old_uploads(max_age_seconds=86400):
             pass
 
 
+_WIN_RESERVED_NAMES = {
+    'CON', 'PRN', 'AUX', 'NUL',
+    *(f'COM{i}' for i in range(1, 10)),
+    *(f'LPT{i}' for i in range(1, 10)),
+}
+
+
 def safe_filename(name):
-    """清洗文件名中的非法字符。"""
+    """清洗文件名中的非法字符并规避 Windows 设备保留名（CON/NUL/PRN/COM1 等）。"""
     cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', (name or 'file').strip())
-    return cleaned.strip('.') or 'file'
+    cleaned = cleaned.strip('. ') or 'file'
+    stem_head = cleaned.split('.', 1)[0].upper()
+    if stem_head in _WIN_RESERVED_NAMES:
+        cleaned = f'_{cleaned}'
+    return cleaned
 
 
 def clean_stem(path):
@@ -196,7 +207,7 @@ def preview_batch_rename(folder, find_text='', replace_text='', prefix='', suffi
         if suffix:
             stem = stem + suffix
         if numbering:
-            num_str = str(start_num + idx).zfill(max(1, int(pad_digits)))
+            num_str = str(start_num + idx).zfill(max(1, min(12, int(pad_digits))))
             stem = f'{stem}_{num_str}' if stem else num_str
         if new_ext.strip():
             ext = '.' + new_ext.strip().lstrip('.')

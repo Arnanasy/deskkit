@@ -28,9 +28,15 @@ def parse_pages(expr, total_pages):
             continue
         if '-' in part:
             a, b = part.split('-', 1)
-            start = max(1, int(a.strip()))
-            end = min(total_pages, int(b.strip()))
-            step = 1 if start <= end else -1
+            raw_start, raw_end = int(a.strip()), int(b.strip())
+            if raw_start <= raw_end:
+                if raw_end < 1 or raw_start > total_pages:
+                    continue
+                start, end, step = max(1, raw_start), min(total_pages, raw_end), 1
+            else:
+                if raw_start < 1 or raw_end > total_pages:
+                    continue
+                start, end, step = min(total_pages, raw_start), max(1, raw_end), -1
             for p in range(start, end + step, step):
                 idx = p - 1
                 if 0 <= idx < total_pages and idx not in seen:
@@ -228,13 +234,21 @@ def compress_pdf(path_str, level='balanced', out_dir=None):
 
 
 def _word_convert(src_path, dst_path, wd_format):
-    """通过独立 PowerShell STA 进程调用本机 Microsoft Word COM 导出 PDF（带超时与进程清理）。"""
+    """通过独立 PowerShell STA 进程调用本机 Microsoft Word COM 导出 PDF（超时精准清理本次拉起的 WINWORD 进程）。"""
+    import tempfile
+    import uuid
+
+    pid_file = Path(tempfile.gettempdir()) / f'toolbox_word_{uuid.uuid4().hex[:8]}.pid'
     ps_script = (
         '$ErrorActionPreference = "Stop"\n'
-        '$src = $args[0]; $dst = $args[1]; $fmt = [int]$args[2]\n'
+        '$src = $args[0]; $dst = $args[1]; $fmt = [int]$args[2]; $pidFile = $args[3]\n'
         '$word = $null; $doc = $null\n'
         'try {\n'
+        '    $before = @(Get-Process -Name WINWORD -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id)\n'
         '    $word = New-Object -ComObject Word.Application\n'
+        '    $after = @(Get-Process -Name WINWORD -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id)\n'
+        '    $newPids = $after | Where-Object { $before -notcontains $_ }\n'
+        '    if ($newPids) { ($newPids -join ",") | Set-Content -Path $pidFile -Encoding ASCII }\n'
         '    $word.Visible = $false\n'
         '    $word.DisplayAlerts = 0\n'
         '    $doc = $word.Documents.Open($src, $false, $true, $false)\n'
@@ -245,16 +259,31 @@ def _word_convert(src_path, dst_path, wd_format):
         '}\n'
     )
     try:
-        run = subprocess.run(
+        proc = subprocess.Popen(
             ['powershell.exe', '-NoProfile', '-NonInteractive', '-STA', '-Command',
-             f'& {{ {ps_script} }}', str(src_path), str(dst_path), str(wd_format)],
-            capture_output=True, text=True, encoding='utf-8', errors='replace',
-            timeout=30, creationflags=_NO_WINDOW,
+             f'& {{ {ps_script} }}', str(src_path), str(dst_path), str(wd_format), str(pid_file)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            encoding='utf-8', errors='replace', creationflags=_NO_WINDOW,
         )
-    except subprocess.TimeoutExpired:
-        raise RuntimeError('Word 后台转换超时（可能是 Office 首次启动或弹出授权提示），请先手动打开一次 Word 后重试')
-    if run.returncode != 0 or not Path(dst_path).exists():
-        detail = (run.stderr or run.stdout or '').strip().splitlines()
+        try:
+            stdout, stderr = proc.communicate(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            # 仅精准结束本次 COM 启动的 WINWORD.EXE，不误杀用户自己打开的 Word 文档
+            if pid_file.exists():
+                for raw_pid in pid_file.read_text(encoding='ascii', errors='ignore').split(','):
+                    raw_pid = raw_pid.strip()
+                    if raw_pid.isdigit():
+                        subprocess.run(
+                            ['taskkill', '/F', '/PID', raw_pid],
+                            capture_output=True, creationflags=_NO_WINDOW,
+                        )
+            raise RuntimeError('Word 后台转换超时（可能是 Office 首次启动或弹出授权提示），请先手动打开一次 Word 后重试')
+    finally:
+        pid_file.unlink(missing_ok=True)
+    if proc.returncode != 0 or not Path(dst_path).exists():
+        detail = (stderr or stdout or '').strip().splitlines()
         msg = detail[-1] if detail else 'Word 转换失败，请确认已安装 Microsoft Word 且文件未加密损坏'
         raise RuntimeError(msg)
 

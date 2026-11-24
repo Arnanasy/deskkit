@@ -320,9 +320,9 @@ setupDropzone($('#video-drop'), async (files) => {
 
 async function startVideoJob(mode, options) {
   if (!state.videoPath) return toast('请先选择视频文件');
-  clearInterval(state.videoPoll);
   try {
     const task = await api('/api/video/start', { path: state.videoPath, mode, options });
+    clearInterval(state.videoPoll);
     state.videoTaskId = task.id;
     $('#video-progress-box').style.display = 'block';
     $('#vp-desc').textContent = task.mode_desc;
@@ -620,7 +620,7 @@ setupDropzone($('#p2w-drop'), async (files) => {
 $('#btn-p2w-run').onclick = async () => {
   if (!state.p2wPath) return toast('请先选择 PDF 文件');
   try {
-    toast('正在调用本机 Word 转换，请稍候…');
+    toast('正在转换 PDF 为 Word，请稍候…');
     const res = await api('/api/pdf/to-word', { path: state.p2wPath });
     const note = res.is_scanned ? ' · ⚠️ 检测到扫描图片型 PDF，转换后内容仍为图片' : '';
     renderResultCard($('#pdf-result'), 'PDF 转 Word 完成', res.path, res.name,
