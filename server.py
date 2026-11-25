@@ -1,4 +1,4 @@
-"""本地工具箱 HTTP 服务（纯 Python 标准库，仅监听 127.0.0.1，带 Host/Token/CSP 防护）。"""
+"""DeskKit 本地 HTTP 服务（纯 Python 标准库，仅监听 127.0.0.1，带 Host/Token/CSP 防护）。"""
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import logging
@@ -44,7 +44,7 @@ log = logging.getLogger('toolbox')
 log.setLevel(logging.WARNING)
 if not log.handlers:
     _handler = RotatingFileHandler(
-        APP_DIR / '工具箱错误.log', maxBytes=512000, backupCount=1, delay=True, encoding='utf-8'
+        APP_DIR / 'DeskKit_error.log', maxBytes=512000, backupCount=1, delay=True, encoding='utf-8'
     )
     _handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
     log.addHandler(_handler)
@@ -596,7 +596,7 @@ def create_server(start_port=DEFAULT_PORT):
 
 if __name__ == '__main__':
     srv, p = create_server()
-    print(f'本地工具箱已启动: http://127.0.0.1:{p}')
+    print(f'DeskKit 已启动: http://127.0.0.1:{p}')
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

@@ -1,4 +1,4 @@
-"""静默启动本地工具箱并在浏览器打开；若已在运行则直接复用现有实例。"""
+"""静默启动 DeskKit 并在浏览器打开；若已在运行则直接复用现有实例。"""
 import ctypes
 from pathlib import Path
 import sys
@@ -46,9 +46,9 @@ if __name__ == '__main__':
     try:
         main()
     except Exception as err:
-        log_file = APP_DIR / '工具箱错误.log'
+        log_file = APP_DIR / 'DeskKit_error.log'
         with open(log_file, 'a', encoding='utf-8') as f:
             f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {err!r}\n")
         ctypes.WinDLL('user32').MessageBoxW(
-            None, f'本地工具箱启动失败：\n{err}', '本地工具箱', 0x10
+            None, f'DeskKit 启动失败：\n{err}', 'DeskKit', 0x10
         )

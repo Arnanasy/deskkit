@@ -2,6 +2,10 @@
 setlocal
 cd /d "%~dp0"
 if not exist "launch.pyw" goto missing
+if exist ".venv\Scripts\pythonw.exe" (
+  start "" ".venv\Scripts\pythonw.exe" -B "launch.pyw"
+  exit /b
+)
 for %%P in (pythonw.exe pyw.exe) do if not "%%~$PATH:P"=="" (
   start "" "%%~$PATH:P" -B "launch.pyw"
   exit /b

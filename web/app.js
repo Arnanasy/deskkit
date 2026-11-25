@@ -208,9 +208,9 @@ $$('.subtabs').forEach((group) => {
 
 $('#btn-open-out').onclick = () => openPath(state.outputDir);
 $('#btn-shutdown').onclick = async () => {
-  if (!confirm('确定要停止本地工具箱后台服务吗？')) return;
+  if (!confirm('确定要停止 DeskKit 后台服务吗？')) return;
   try { await api('/api/shutdown', {}); } catch (_) {}
-  document.body.innerHTML = '<div style="padding:60px;text-align:center;"><h2>本地工具箱已安全退出</h2><p style="color:#64748b;">可以直接关闭此标签页，下次双击「启动工具箱.cmd」重新打开。</p></div>';
+  document.body.innerHTML = '<div style="padding:60px;text-align:center;"><h2>DeskKit 已安全退出</h2><p style="color:#64748b;">可以直接关闭此标签页，下次双击「DeskKit.cmd」重新打开。</p></div>';
 };
 
 // 初始化健康检查
@@ -999,7 +999,7 @@ $('#btn-json-min').onclick = () => {
 $('#btn-json-copy').onclick = () => copyText($('#tj-input').value, '已复制 JSON');
 
 function genQR() {
-  const txt = $('#qr-text').value.trim() || '本地工具箱 · 离线二维码';
+  const txt = $('#qr-text').value.trim() || 'DeskKit · 离线二维码';
   try {
     window.drawQRCode($('#qr-canvas'), txt, 240);
     $('#qr-tip').textContent = `纯离线生成 · ${new TextEncoder().encode(txt).length} 字节`;

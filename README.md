@@ -1,6 +1,6 @@
-# 本地工具箱
+# DeskKit
 
-纯本地运行的无广告私人工具箱（Windows），零云端上传、离线可用。
+纯本地运行的无广告私人桌面工具箱（Windows），零云端上传、离线可用。
 
 ## 功能概览
 
@@ -23,11 +23,21 @@
 
 ## 启动方式
 
-双击 `启动工具箱.cmd` 即可无黑框启动本地服务并自动在浏览器打开；所有导出文件默认保存在 `下载\工具箱输出`。
+双击 `DeskKit.cmd` 即可无黑框启动本地服务并自动在浏览器打开；所有导出文件默认保存在 `下载\工具箱输出`。
+
+## 运行单元测试
+
+```bash
+python -m unittest discover -s tests -v
+```
 
 ## 目录说明
 
-- `启动工具箱.cmd` / `launch.pyw`：无黑框一键启动入口（自动复用已运行实例）
+- `DeskKit.cmd` / `launch.pyw`：无黑框一键启动入口（自动优先识别 `.venv` 并复用已运行实例）
 - `server.py`：本地 HTTP 服务（仅监听 `127.0.0.1`，带 Host / Token / CSP 安全防护）
 - `tools_video.py` / `tools_image.py` / `tools_pdf.py` / `tools_files.py`：各模块后端实现
 - `web/`：纯离线前端界面（`index.html`、`style.css`、`app.js`、`qrcode.js`）
+
+## 开源协议
+
+本项目基于 [MIT License](LICENSE) 开源。

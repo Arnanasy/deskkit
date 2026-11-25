@@ -1,3 +1,5 @@
 Pillow>=10.0.0
 PyMuPDF>=1.24.0
 pdf2docx>=0.5.8
+# 可选但推荐：支持读取 iPhone / 手机 HEIC、HEIF 照片
+pillow-heif>=0.16.0
