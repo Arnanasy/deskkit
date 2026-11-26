@@ -59,6 +59,10 @@ if not log.handlers:
     log.addHandler(_handler)
 
 
+class PathForbiddenError(PermissionError):
+    """请求访问未经上传、输出或系统弹窗授权的本地路径时抛出。"""
+
+
 class ToolboxHandler(BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
 
@@ -79,6 +83,15 @@ class ToolboxHandler(BaseHTTPRequestHandler):
         host = (self.headers.get('Host') or '').strip().lower()
         if host not in self._allowed_hosts():
             self._send_json({'error': '非法的 Host 来源'}, 403)
+            return False
+        return True
+
+    def _check_get_token(self, qs):
+        """校验 GET /api/* 接口令牌（支持 Header 或查询参数 token），阻断跨站侧信道与未授权读取。"""
+        token = (self.headers.get('X-Toolbox-Token') or qs.get('token', [''])[0] or '').strip()
+        expected = getattr(self.server, 'api_token', '')
+        if not expected or not secrets.compare_digest(token, expected):
+            self._send_json({'error': '缺少或无效的安全令牌'}, 403)
             return False
         return True
 
@@ -136,15 +149,41 @@ class ToolboxHandler(BaseHTTPRequestHandler):
         self.send_header('Cache-Control', 'no-store')
         if target.name == 'index.html':
             self.send_header('Content-Security-Policy', CSP_HEADER)
+            self.send_header('Referrer-Policy', 'no-referrer')
         self.end_headers()
         self.wfile.write(data)
 
     def _can_preview(self, target):
-        """仅允许预览输出目录、上传目录，或本会话通过系统弹窗主动选中的文件。"""
+        """仅允许访问输出目录、上传目录，或本会话通过系统弹窗主动选中的文件。"""
         if is_within(target, OUTPUT_DIR) or is_within(target, UPLOAD_DIR):
             return True
         allowed = getattr(self.server, 'allowed_paths', set())
         return str(target).lower() in allowed
+
+    def _require_file(self, path_str):
+        """强制校验 POST 处理接口传入的单文件路径位于授权白名单内。"""
+        if not isinstance(path_str, str) or not path_str.strip():
+            raise ValueError('文件路径不能为空')
+        target = Path(path_str).resolve()
+        if not self._can_preview(target):
+            raise PathForbiddenError('无权访问未经选择或上传的本地文件路径')
+        return str(target)
+
+    def _require_files(self, paths):
+        """强制校验 POST 批量接口传入的所有文件路径均位于授权白名单内。"""
+        if not isinstance(paths, list) or not paths:
+            raise ValueError('请至少选择 1 个文件')
+        return [self._require_file(p) for p in paths]
+
+    def _require_folder(self, folder_str):
+        """强制校验批量重命名文件夹必须经由本会话系统文件夹弹窗授权。"""
+        if not isinstance(folder_str, str) or not folder_str.strip():
+            raise ValueError('请先点击「选择目标文件夹」选定目录')
+        target = Path(folder_str).resolve()
+        allowed_dirs = getattr(self.server, 'allowed_folders', set())
+        if str(target).lower() not in allowed_dirs:
+            raise PathForbiddenError('请通过「选择目标文件夹」按钮授权要操作的目录')
+        return str(target)
 
     def _serve_preview(self, path_str):
         target = Path(path_str).resolve()
@@ -279,38 +318,50 @@ class ToolboxHandler(BaseHTTPRequestHandler):
         path = parsed.path
         qs = parse_qs(parsed.query)
         try:
+            # 仅暴露零敏感信息的存活探针供单实例启动器检测，其余全部 /api/* 强制要求有效 Token
             if path == '/api/health':
-                ffmpeg, ffprobe = ffmpeg_bins()
-                self._send_json({
-                    'ok': True,
-                    'output_dir': str(OUTPUT_DIR),
-                    'ffmpeg': bool(ffmpeg and ffprobe),
-                    'nvenc': has_nvenc(),
-                })
+                self._send_json({'ok': True})
                 return
 
-            if path == '/api/download':
-                file_path = qs.get('path', [''])[0]
-                self._serve_download(file_path)
-                return
+            if path.startswith('/api/'):
+                if not self._check_get_token(qs):
+                    return
 
-            if path == '/api/preview':
-                file_path = qs.get('path', [''])[0]
-                self._serve_preview(file_path)
-                return
+                if path == '/api/env':
+                    ffmpeg, ffprobe = ffmpeg_bins()
+                    self._send_json({
+                        'ok': True,
+                        'output_dir': str(OUTPUT_DIR),
+                        'ffmpeg': bool(ffmpeg and ffprobe),
+                        'nvenc': has_nvenc(),
+                    })
+                    return
 
-            if path == '/api/video/thumb':
-                file_path = qs.get('path', [''])[0]
-                self._serve_video_thumb(file_path)
-                return
+                if path == '/api/download':
+                    file_path = qs.get('path', [''])[0]
+                    self._serve_download(file_path)
+                    return
 
-            if path.startswith('/api/video/task/'):
-                task_id = path.rsplit('/', 1)[-1]
-                task = video_tasks.get(task_id)
-                if not task:
-                    self._send_json({'error': '任务不存在'}, 404)
-                else:
-                    self._send_json(task)
+                if path == '/api/preview':
+                    file_path = qs.get('path', [''])[0]
+                    self._serve_preview(file_path)
+                    return
+
+                if path == '/api/video/thumb':
+                    file_path = qs.get('path', [''])[0]
+                    self._serve_video_thumb(file_path)
+                    return
+
+                if path.startswith('/api/video/task/'):
+                    task_id = path.rsplit('/', 1)[-1]
+                    task = video_tasks.get(task_id)
+                    if not task:
+                        self._send_json({'error': '任务不存在'}, 404)
+                    else:
+                        self._send_json(task)
+                    return
+
+                self._send_json({'error': '未知接口'}, 404)
                 return
 
             self._serve_static(path)
@@ -372,6 +423,10 @@ class ToolboxHandler(BaseHTTPRequestHandler):
 
             if path == '/api/pick-folder':
                 folder = pick_folder(title=data.get('title', '选择文件夹'))
+                if folder:
+                    allowed_dirs = getattr(self.server, 'allowed_folders', None)
+                    if allowed_dirs is not None:
+                        allowed_dirs.add(str(Path(folder).resolve()).lower())
                 self._send_json({'folder': folder})
                 return
 
@@ -391,13 +446,13 @@ class ToolboxHandler(BaseHTTPRequestHandler):
 
             # ---- 视频工坊 ----
             if path == '/api/video/probe':
-                self._send_json(probe_video(data['path']))
+                self._send_json(probe_video(self._require_file(data.get('path', ''))))
                 return
 
             if path == '/api/video/start':
                 opts = dict(data.get('options') or {})
                 opts.pop('output_dir', None)  # 禁止通过 HTTP 参数指定任意输出目录
-                task = video_tasks.start(data['path'], data['mode'], opts)
+                task = video_tasks.start(self._require_file(data.get('path', '')), data['mode'], opts)
                 self._send_json(task)
                 return
 
@@ -409,13 +464,13 @@ class ToolboxHandler(BaseHTTPRequestHandler):
             if path == '/api/video/merge':
                 opts = dict(data.get('options') or {})
                 opts.pop('output_dir', None)  # 禁止通过 HTTP 参数指定任意输出目录
-                task = video_tasks.start_merge(data.get('paths', []), opts)
+                task = video_tasks.start_merge(self._require_files(data.get('paths', [])), opts)
                 self._send_json(task)
                 return
 
             if path == '/api/video/frames':
                 res = export_video_frames(
-                    path_str=data['path'],
+                    path_str=self._require_file(data.get('path', '')),
                     mode=data.get('mode', 'interval'),
                     interval=data.get('interval', 2.0),
                     count=data.get('count', 10),
@@ -428,7 +483,7 @@ class ToolboxHandler(BaseHTTPRequestHandler):
 
             if path == '/api/video/subtitle':
                 res = convert_subtitle(
-                    path_str=data['path'],
+                    path_str=self._require_file(data.get('path', '')),
                     target_fmt=data.get('format', 'srt'),
                 )
                 self._send_json(res)
@@ -437,7 +492,7 @@ class ToolboxHandler(BaseHTTPRequestHandler):
             # ---- 图片工坊 ----
             if path == '/api/image/process':
                 res = process_convert_compress(
-                    paths=data.get('paths', []),
+                    paths=self._require_files(data.get('paths', [])),
                     target_fmt=data.get('format', 'keep'),
                     quality=data.get('quality', 82),
                     max_width=data.get('max_width', 0),
@@ -449,7 +504,7 @@ class ToolboxHandler(BaseHTTPRequestHandler):
 
             if path == '/api/image/stitch':
                 res = stitch_images(
-                    paths=data.get('paths', []),
+                    paths=self._require_files(data.get('paths', [])),
                     mode=data.get('mode', 'vertical'),
                     gap=data.get('gap', 0),
                     bg_color=data.get('bg_color', '#ffffff'),
@@ -461,7 +516,7 @@ class ToolboxHandler(BaseHTTPRequestHandler):
 
             if path == '/api/image/rotate':
                 res = rotate_flip_images(
-                    paths=data.get('paths', []),
+                    paths=self._require_files(data.get('paths', [])),
                     op=data.get('op', 'cw90'),
                     out_fmt=data.get('format', 'keep'),
                 )
@@ -470,7 +525,7 @@ class ToolboxHandler(BaseHTTPRequestHandler):
 
             if path == '/api/image/split':
                 res = split_image(
-                    path_str=data['path'],
+                    path_str=self._require_file(data.get('path', '')),
                     mode=data.get('mode', 'vertical'),
                     parts=data.get('parts', 3),
                     rows=data.get('rows', 3),
@@ -483,16 +538,16 @@ class ToolboxHandler(BaseHTTPRequestHandler):
 
             # ---- PDF 工坊 ----
             if path == '/api/pdf/info':
-                self._send_json(pdf_info(data['path']))
+                self._send_json(pdf_info(self._require_file(data.get('path', ''))))
                 return
 
             if path == '/api/pdf/merge':
-                self._send_json(merge_pdfs(data.get('paths', [])))
+                self._send_json(merge_pdfs(self._require_files(data.get('paths', []))))
                 return
 
             if path == '/api/pdf/edit':
                 self._send_json(edit_pages(
-                    path_str=data['path'],
+                    path_str=self._require_file(data.get('path', '')),
                     action=data['action'],
                     pages_expr=data.get('pages', ''),
                     angle=data.get('angle', 90),
@@ -501,7 +556,7 @@ class ToolboxHandler(BaseHTTPRequestHandler):
 
             if path == '/api/pdf/to-images':
                 self._send_json(pdf_to_images(
-                    path_str=data['path'],
+                    path_str=self._require_file(data.get('path', '')),
                     fmt=data.get('format', 'png'),
                     dpi=data.get('dpi', 150),
                     pages_expr=data.get('pages', ''),
@@ -509,24 +564,24 @@ class ToolboxHandler(BaseHTTPRequestHandler):
                 return
 
             if path == '/api/pdf/from-images':
-                self._send_json(images_to_pdf(data.get('paths', [])))
+                self._send_json(images_to_pdf(self._require_files(data.get('paths', []))))
                 return
 
             if path == '/api/pdf/compress':
-                self._send_json(compress_pdf(data['path'], level=data.get('level', 'balanced')))
+                self._send_json(compress_pdf(self._require_file(data.get('path', '')), level=data.get('level', 'balanced')))
                 return
 
             if path == '/api/pdf/to-word':
-                self._send_json(pdf_to_word(data['path']))
+                self._send_json(pdf_to_word(self._require_file(data.get('path', ''))))
                 return
 
             if path == '/api/pdf/from-word':
-                self._send_json(word_to_pdf(data['path']))
+                self._send_json(word_to_pdf(self._require_file(data.get('path', ''))))
                 return
 
             if path == '/api/pdf/protect':
                 self._send_json(protect_pdf(
-                    path_str=data['path'],
+                    path_str=self._require_file(data.get('path', '')),
                     user_pw=data.get('user_pw', ''),
                     owner_pw=data.get('owner_pw', ''),
                     allow_print=bool(data.get('allow_print', True)),
@@ -536,7 +591,7 @@ class ToolboxHandler(BaseHTTPRequestHandler):
 
             if path == '/api/pdf/unlock':
                 self._send_json(unlock_pdf(
-                    path_str=data['path'],
+                    path_str=self._require_file(data.get('path', '')),
                     password=data.get('password', ''),
                 ))
                 return
@@ -544,27 +599,27 @@ class ToolboxHandler(BaseHTTPRequestHandler):
             # ---- 编码修复 / ZIP 修复 / 文件哈希 ----
             if path == '/api/file/zip-fix':
                 self._send_json(fix_zip_encoding(
-                    path_str=data['path'],
+                    path_str=self._require_file(data.get('path', '')),
                     source_encoding=data.get('source_encoding', 'auto'),
                 ))
                 return
 
             if path == '/api/file/text-fix':
                 self._send_json(fix_text_encoding(
-                    path_str=data['path'],
+                    path_str=self._require_file(data.get('path', '')),
                     source_encoding=data.get('source_encoding', 'auto'),
                     target_encoding=data.get('target_encoding', 'utf-8'),
                 ))
                 return
 
             if path == '/api/file/hash':
-                self._send_json(calc_file_hash(data['path']))
+                self._send_json(calc_file_hash(self._require_file(data.get('path', ''))))
                 return
 
             # ---- 批量重命名 ----
             if path == '/api/rename/preview':
                 res = preview_batch_rename(
-                    folder=data.get('folder', ''),
+                    folder=self._require_folder(data.get('folder', '')),
                     find_text=data.get('find', ''),
                     replace_text=data.get('replace', ''),
                     prefix=data.get('prefix', ''),
@@ -581,11 +636,17 @@ class ToolboxHandler(BaseHTTPRequestHandler):
                 return
 
             if path == '/api/rename/execute':
-                res = execute_batch_rename(data.get('folder', ''), data.get('items', []))
+                res = execute_batch_rename(
+                    self._require_folder(data.get('folder', '')),
+                    data.get('items', []),
+                )
                 self._send_json(res)
                 return
 
             self._send_json({'error': '未知接口'}, 404)
+        except PathForbiddenError as err:
+            log.warning('POST %s 未授权路径被拦截: %s', path, err)
+            self._send_json({'error': str(err)}, 403)
         except Exception as err:
             log.warning('POST %s 失败: %s', path, err)
             self._send_json({'error': str(err)}, 400)
@@ -600,6 +661,7 @@ def create_server(start_port=DEFAULT_PORT):
             httpd.daemon_threads = True
             httpd.api_token = secrets.token_hex(16)
             httpd.allowed_paths = set()
+            httpd.allowed_folders = set()
             httpd.on_shutdown = None
             return httpd, port
         except OSError:

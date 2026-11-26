@@ -36,7 +36,7 @@ python -m unittest discover -s tests -v
 ## 目录说明
 
 - `DeskKit.cmd` / `launch.pyw` / `tray.py`：无黑框启动入口与右下角系统托盘（自动优先识别 `.venv`、支持 PyInstaller 单文件打包并复用已运行实例）
-- `server.py`：本地 HTTP 服务（仅监听 `127.0.0.1`，带 Host / Token / CSP 安全防护）
+- `server.py`：本地 HTTP 服务（仅监听 `127.0.0.1`，全量 `GET/POST` 令牌鉴权、授权路径白名单与 CSP 防护）
 - `tools_video.py` / `tools_image.py` / `tools_pdf.py` / `tools_files.py`：各模块后端实现
 - `web/`：纯离线前端界面（`index.html`、`style.css`、`app.js`、`qrcode.js`）
 

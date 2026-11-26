@@ -489,21 +489,23 @@ class TestServerAndTray(unittest.TestCase):
         self.assertTrue(bool(hicon))
         tray.user32.DestroyIcon(hicon)
 
-    def test_server_host_and_csrf_token_protection(self):
+    def test_server_host_get_token_and_post_whitelist_defense_in_depth(self):
         import json
         import threading
         from urllib.error import HTTPError
+        from urllib.parse import quote
         from urllib.request import Request, urlopen
         import server
 
         httpd, port = server.create_server(18700)
+        tok = httpd.api_token
         t = threading.Thread(target=httpd.serve_forever, daemon=True)
         t.start()
         try:
-            # 1. 正常健康检查
+            # 1. /api/health 仅返回基础存活布尔值，不暴露本机路径
             with urlopen(f'http://127.0.0.1:{port}/api/health', timeout=3) as resp:
                 data = json.loads(resp.read().decode('utf-8'))
-                self.assertTrue(data['ok'])
+                self.assertEqual(data, {'ok': True})
 
             # 2. 伪造 Host 头应被 403 拦截（防 DNS Rebinding）
             bad_host_req = Request(f'http://127.0.0.1:{port}/api/health', headers={'Host': 'evil.example.com'})
@@ -511,7 +513,18 @@ class TestServerAndTray(unittest.TestCase):
                 urlopen(bad_host_req, timeout=3)
             self.assertEqual(ctx1.exception.code, 403)
 
-            # 3. 缺少 X-Toolbox-Token 的 POST 请求应被 403 拦截（防 CSRF）
+            # 3. GET /api/* 未携带 Token 一律 403 拦截；携带 Header 或 Query Token 正常放行
+            for sub in ('/api/env', '/api/preview?path=x', '/api/download?path=x', '/api/video/thumb?path=x', '/api/video/task/1'):
+                with self.assertRaises(HTTPError) as ctx_g:
+                    urlopen(f'http://127.0.0.1:{port}{sub}', timeout=3)
+                self.assertEqual(ctx_g.exception.code, 403)
+
+            env_req = Request(f'http://127.0.0.1:{port}/api/env', headers={'X-Toolbox-Token': tok})
+            with urlopen(env_req, timeout=3) as resp_env:
+                env_data = json.loads(resp_env.read().decode('utf-8'))
+                self.assertIn('output_dir', env_data)
+
+            # 4. 缺少 X-Toolbox-Token 的 POST 请求应被 403 拦截（防 CSRF）
             no_tok_req = Request(
                 f'http://127.0.0.1:{port}/api/rename/preview',
                 data=b'{}',
@@ -521,6 +534,44 @@ class TestServerAndTray(unittest.TestCase):
             with self.assertRaises(HTTPError) as ctx2:
                 urlopen(no_tok_req, timeout=3)
             self.assertEqual(ctx2.exception.code, 403)
+
+            # 5. 携带合法 Token，但传入未经白名单授权的文件或文件夹路径 -> 必须被 403 拦截
+            with tempfile.TemporaryDirectory() as tmp:
+                secret_dir = Path(tmp) / '未授权中文目录'
+                secret_dir.mkdir()
+                secret_file = secret_dir / '机密.txt'
+                secret_file.write_text('hello', encoding='utf-8')
+
+                def post_json(api_path, payload):
+                    req = Request(
+                        f'http://127.0.0.1:{port}{api_path}',
+                        data=json.dumps(payload).encode('utf-8'),
+                        headers={'Content-Type': 'application/json', 'X-Toolbox-Token': tok},
+                        method='POST',
+                    )
+                    return urlopen(req, timeout=3)
+
+                with self.assertRaises(HTTPError) as ctx_f:
+                    post_json('/api/file/hash', {'path': str(secret_file)})
+                self.assertEqual(ctx_f.exception.code, 403)
+
+                with self.assertRaises(HTTPError) as ctx_d:
+                    post_json('/api/rename/preview', {'folder': str(secret_dir)})
+                self.assertEqual(ctx_d.exception.code, 403)
+
+                # 模拟经系统弹窗授权加入白名单后，GET 预览（带 query token）与 POST 处理均正常放行
+                httpd.allowed_paths.add(str(secret_file.resolve()).lower())
+                httpd.allowed_folders.add(str(secret_dir.resolve()).lower())
+
+                with post_json('/api/file/hash', {'path': str(secret_file)}) as ok_f:
+                    self.assertEqual(ok_f.status, 200)
+                with post_json('/api/rename/preview', {'folder': str(secret_dir)}) as ok_d:
+                    self.assertEqual(ok_d.status, 200)
+                with urlopen(
+                    f'http://127.0.0.1:{port}/api/preview?path={quote(str(secret_file))}&token={tok}',
+                    timeout=3,
+                ) as ok_prev:
+                    self.assertEqual(ok_prev.read(), b'hello')
         finally:
             httpd.shutdown()
             httpd.server_close()

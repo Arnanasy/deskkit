@@ -81,7 +81,7 @@ const API_TOKEN = document.querySelector('meta[name="toolbox-token"]')?.content 
 
 async function api(url, body) {
   const opt = body === undefined
-    ? { method: 'GET' }
+    ? { method: 'GET', headers: { 'X-Toolbox-Token': API_TOKEN } }
     : {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'X-Toolbox-Token': API_TOKEN },
@@ -136,11 +136,11 @@ function openPath(p) {
 }
 
 function downloadUrl(p) {
-  return `/api/download?path=${encodeURIComponent(p)}`;
+  return `/api/download?path=${encodeURIComponent(p)}&token=${encodeURIComponent(API_TOKEN)}`;
 }
 
 function previewUrl(p) {
-  return `/api/preview?path=${encodeURIComponent(p)}&t=${Date.now()}`;
+  return `/api/preview?path=${encodeURIComponent(p)}&token=${encodeURIComponent(API_TOKEN)}&t=${Date.now()}`;
 }
 
 function buildPreviewHtml(filePath) {
@@ -240,8 +240,8 @@ $('#btn-shutdown').onclick = async () => {
   document.body.innerHTML = '<div style="padding:60px;text-align:center;"><h2>DeskKit 已安全退出</h2><p style="color:#64748b;">可以直接关闭此标签页，下次双击「DeskKit.cmd」重新打开。</p></div>';
 };
 
-// 初始化健康检查
-api('/api/health').then((h) => {
+// 初始化环境详情查询（经由鉴权接口获取）
+api('/api/env').then((h) => {
   state.outputDir = h.output_dir;
   const nv = h.nvenc ? 'NVENC 硬编可用' : 'CPU x264 编码';
   $('#env-status').innerHTML = `<span class="env-dot"></span>FFmpeg ${h.ffmpeg ? '就绪' : '缺失'}<br>${nv}`;
@@ -300,7 +300,7 @@ async function loadVideo(path) {
     thumb.style.display = 'none';
     thumb.onload = () => { thumb.style.display = 'block'; };
     thumb.onerror = () => { thumb.style.display = 'none'; };
-    thumb.src = `/api/video/thumb?path=${encodeURIComponent(info.path)}&t=${Date.now()}`;
+    thumb.src = `/api/video/thumb?path=${encodeURIComponent(info.path)}&token=${encodeURIComponent(API_TOKEN)}&t=${Date.now()}`;
     $('#v-src-preview').innerHTML = '';
     $('#btn-video-preview').textContent = '▶ 预览原视频';
   } catch (e) {
@@ -1174,6 +1174,7 @@ $('#btn-rn-folder').onclick = async () => {
   const res = await api('/api/pick-folder', { title: '选择要批量重命名的文件夹' });
   if (res.folder) $('#rn-folder').value = res.folder;
 };
+$('#rn-folder').onclick = () => $('#btn-rn-folder').click();
 $('#btn-rn-preview').onclick = async () => {
   try {
     const res = await api('/api/rename/preview', {
