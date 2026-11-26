@@ -152,50 +152,89 @@ def _time_to_seconds(s):
 
 
 class VideoTaskManager:
-    """后台执行 FFmpeg 转码任务，通过 -progress 管道提供实时百分比进度、取消与回收能力。"""
+    """后台执行 FFmpeg 转码任务（单并发保护 CPU/显卡，多任务自动排队依次执行，支持随时取消与回收）。"""
 
     MAX_HISTORY = 50
     MAX_CONCURRENT = 1
+    MAX_QUEUE = 20
 
     def __init__(self):
         self._tasks = {}
+        self._queue = []            # [(task_id, cmd, out_path, est_duration, cleanup_paths), ...]
+        self._worker_alive = False
         self._lock = threading.Lock()
 
     def _prune_locked(self):
         finished = [
             (tid, t.get('started_at', 0))
             for tid, t in self._tasks.items()
-            if t.get('status') != 'running'
+            if t.get('status') not in ('running', 'queued')
         ]
         if len(finished) > self.MAX_HISTORY:
             finished.sort(key=lambda x: x[1])
             for tid, _ in finished[:len(finished) - self.MAX_HISTORY]:
                 self._tasks.pop(tid, None)
 
+    def _queue_position_locked(self, task_id):
+        for idx, item in enumerate(self._queue, 1):
+            if item[0] == task_id:
+                return idx
+        return 0
+
     def get(self, task_id):
         with self._lock:
             task = self._tasks.get(task_id)
             if not task:
                 return None
-            return {k: v for k, v in task.items() if k != '_proc'}
+            snap = {k: v for k, v in task.items() if k != '_proc'}
+            if snap.get('status') == 'queued':
+                snap['queue_pos'] = self._queue_position_locked(task_id)
+            return snap
 
     def cancel(self, task_id):
+        cleanup = []
+        out_to_remove = None
         with self._lock:
             task = self._tasks.get(task_id)
             if not task:
                 return False
             task['cancelled'] = True
-            proc = task.get('_proc')
-            if proc and proc.poll() is None:
-                try:
-                    proc.terminate()
-                except OSError:
-                    pass
-            return True
+            if task.get('status') == 'queued':
+                task['status'] = 'cancelled'
+                kept = []
+                for item in self._queue:
+                    if item[0] == task_id:
+                        out_to_remove = item[2]
+                        cleanup.extend(item[4] or [])
+                    else:
+                        kept.append(item)
+                self._queue = kept
+            else:
+                proc = task.get('_proc')
+                if proc and proc.poll() is None:
+                    try:
+                        proc.terminate()
+                    except OSError:
+                        pass
+        if out_to_remove is not None:
+            Path(out_to_remove).unlink(missing_ok=True)
+        for cp in cleanup:
+            Path(cp).unlink(missing_ok=True)
+        return True
 
     def cancel_all(self):
-        """退出服务时终止全部运行中的 FFmpeg 子进程，避免遗留孤儿进程。"""
+        """退出服务时取消排队任务并终止全部运行中的 FFmpeg 子进程，避免遗留孤儿进程。"""
+        cleanup = []
+        outs = []
         with self._lock:
+            for tid, _cmd, out_p, _dur, cps in self._queue:
+                t = self._tasks.get(tid)
+                if t:
+                    t['cancelled'] = True
+                    t['status'] = 'cancelled'
+                outs.append(out_p)
+                cleanup.extend(cps or [])
+            self._queue.clear()
             for task in self._tasks.values():
                 if task.get('status') == 'running':
                     task['cancelled'] = True
@@ -205,15 +244,69 @@ class VideoTaskManager:
                             proc.terminate()
                         except OSError:
                             pass
+        for out_p in outs:
+            Path(out_p).unlink(missing_ok=True)
+        for cp in cleanup:
+            Path(cp).unlink(missing_ok=True)
+
+    def _enqueue_or_start(self, task, cmd, out_path, est_duration, cleanup_paths=None):
+        task_id = task['id']
+        with self._lock:
+            if len(self._queue) >= self.MAX_QUEUE:
+                for cp in (cleanup_paths or []):
+                    Path(cp).unlink(missing_ok=True)
+                raise RuntimeError(f'排队中的视频任务已达上限（{self.MAX_QUEUE} 个），请稍后再添加')
+            self._prune_locked()
+            running = sum(1 for t in self._tasks.values() if t.get('status') == 'running')
+            need_spawn = False
+            if running < self.MAX_CONCURRENT and not self._worker_alive:
+                task['status'] = 'running'
+                task['started_at'] = time.time()
+                self._tasks[task_id] = task
+                self._worker_alive = True
+                need_spawn = True
+                first_job = (task_id, cmd, out_path, est_duration, cleanup_paths)
+            else:
+                task['status'] = 'queued'
+                self._tasks[task_id] = task
+                self._queue.append((task_id, cmd, out_path, est_duration, cleanup_paths))
+                if running < self.MAX_CONCURRENT and not self._worker_alive:
+                    first_job = self._queue.pop(0)
+                    self._tasks[first_job[0]]['status'] = 'running'
+                    self._tasks[first_job[0]]['started_at'] = time.time()
+                    self._worker_alive = True
+                    need_spawn = True
+        if need_spawn:
+            threading.Thread(
+                target=self._worker_loop,
+                args=(first_job,),
+                name=f'ffmpeg-worker-{task_id}',
+                daemon=True,
+            ).start()
+        return self.get(task_id)
+
+    def _worker_loop(self, current_job):
+        job = current_job
+        while job is not None:
+            task_id, cmd, out_path, est_duration, cleanup_paths = job
+            self._run_task(task_id, cmd, out_path, est_duration, cleanup_paths)
+            job = None
+            with self._lock:
+                while self._queue:
+                    cand = self._queue.pop(0)
+                    t = self._tasks.get(cand[0])
+                    if t and not t.get('cancelled'):
+                        t['status'] = 'running'
+                        t['started_at'] = time.time()
+                        job = cand
+                        break
+                if job is None:
+                    self._worker_alive = False
 
     def start(self, path_str, mode, options=None):
         ffmpeg, _ = ffmpeg_bins()
         if not ffmpeg:
             raise RuntimeError('未找到 ffmpeg，请确认已安装 FFmpeg')
-        with self._lock:
-            running = sum(1 for t in self._tasks.values() if t.get('status') == 'running')
-            if running >= self.MAX_CONCURRENT:
-                raise RuntimeError('已有视频任务正在处理中，请等待完成或先取消当前任务')
         options = options or {}
         info = probe_video(path_str)
         src = Path(path_str)
@@ -223,7 +316,7 @@ class VideoTaskManager:
         task_id = uuid.uuid4().hex[:12]
         task = {
             'id': task_id,
-            'status': 'running',
+            'status': 'queued',
             'progress': 0,
             'speed': '',
             'mode_desc': mode_desc,
@@ -236,20 +329,7 @@ class VideoTaskManager:
             'started_at': time.time(),
             '_proc': None,
         }
-        with self._lock:
-            running = sum(1 for t in self._tasks.values() if t.get('status') == 'running')
-            if running >= self.MAX_CONCURRENT:
-                raise RuntimeError('已有视频任务正在处理中，请等待完成或先取消当前任务')
-            self._prune_locked()
-            self._tasks[task_id] = task
-
-        threading.Thread(
-            target=self._run_task,
-            args=(task_id, cmd, out_path, est_duration),
-            name=f'ffmpeg-{task_id}',
-            daemon=True,
-        ).start()
-        return self.get(task_id)
+        return self._enqueue_or_start(task, cmd, out_path, est_duration)
 
     def _video_encoder_args(self, use_nvenc, quality, scale_height=0, extra_vf=None):
         vf = list(extra_vf or [])
@@ -278,16 +358,12 @@ class VideoTaskManager:
         return ['-c:v', 'libx264', '-preset', 'medium', '-crf', crf], 'x264 CPU 编码'
 
     def start_merge(self, paths, options=None):
-        """后台合并多个视频（支持无损秒合或兼容不同分辨率/编码的统一重编码合并）。"""
+        """后台合并多个视频（支持无损秒合或兼容不同分辨率/编码的统一重编码合并，支持自动排队）。"""
         if not paths or len(paths) < 2:
             raise ValueError('请至少选择 2 个视频文件进行合并')
         ffmpeg, _ = ffmpeg_bins()
         if not ffmpeg:
             raise RuntimeError('未找到 ffmpeg，请确认已安装 FFmpeg')
-        with self._lock:
-            running = sum(1 for t in self._tasks.values() if t.get('status') == 'running')
-            if running >= self.MAX_CONCURRENT:
-                raise RuntimeError('已有视频任务正在处理中，请等待完成或先取消当前任务')
 
         options = options or {}
         infos = [probe_video(p) for p in paths]
@@ -364,7 +440,7 @@ class VideoTaskManager:
         task_id = uuid.uuid4().hex[:12]
         task = {
             'id': task_id,
-            'status': 'running',
+            'status': 'queued',
             'progress': 0,
             'speed': '',
             'mode_desc': mode_desc,
@@ -377,22 +453,7 @@ class VideoTaskManager:
             'started_at': time.time(),
             '_proc': None,
         }
-        with self._lock:
-            running = sum(1 for t in self._tasks.values() if t.get('status') == 'running')
-            if running >= self.MAX_CONCURRENT:
-                for cp in cleanup_paths:
-                    cp.unlink(missing_ok=True)
-                raise RuntimeError('已有视频任务正在处理中，请等待完成或先取消当前任务')
-            self._prune_locked()
-            self._tasks[task_id] = task
-
-        threading.Thread(
-            target=self._run_task,
-            args=(task_id, cmd, out_path, max(0.5, total_dur), cleanup_paths),
-            name=f'ffmpeg-{task_id}',
-            daemon=True,
-        ).start()
-        return self.get(task_id)
+        return self._enqueue_or_start(task, cmd, out_path, max(0.5, total_dur), cleanup_paths)
 
     def _build_command(self, ffmpeg, src, info, mode, options, out_dir):
         duration = info['duration'] or 0.0

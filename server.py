@@ -6,6 +6,7 @@ from logging.handlers import RotatingFileHandler
 import mimetypes
 from pathlib import Path
 import secrets
+import sys
 import threading
 from urllib.parse import parse_qs, quote, unquote, urlparse
 import uuid
@@ -28,8 +29,10 @@ from tools_video import (
     video_tasks,
 )
 
-APP_DIR = Path(__file__).resolve().parent
-WEB_DIR = APP_DIR / 'web'
+IS_FROZEN = getattr(sys, 'frozen', False)
+APP_DIR = Path(sys.executable).resolve().parent if IS_FROZEN else Path(__file__).resolve().parent
+RESOURCE_DIR = Path(getattr(sys, '_MEIPASS', APP_DIR)) if IS_FROZEN else APP_DIR
+WEB_DIR = RESOURCE_DIR / 'web'
 DEFAULT_PORT = 18642
 PORT_SPAN = 20
 MAX_UPLOAD_BYTES = 4 * 1024 * 1024 * 1024  # 单文件上传上限 4GB
@@ -43,9 +46,15 @@ CSP_HEADER = (
 log = logging.getLogger('toolbox')
 log.setLevel(logging.WARNING)
 if not log.handlers:
-    _handler = RotatingFileHandler(
-        APP_DIR / 'DeskKit_error.log', maxBytes=512000, backupCount=1, delay=True, encoding='utf-8'
-    )
+    try:
+        _log_path = APP_DIR / 'DeskKit_error.log'
+        _handler = RotatingFileHandler(
+            _log_path, maxBytes=512000, backupCount=1, delay=True, encoding='utf-8'
+        )
+    except OSError:
+        _handler = RotatingFileHandler(
+            UPLOAD_DIR.parent / 'DeskKit_error.log', maxBytes=512000, backupCount=1, delay=True, encoding='utf-8'
+        )
     _handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
     log.addHandler(_handler)
 
@@ -374,6 +383,9 @@ class ToolboxHandler(BaseHTTPRequestHandler):
             if path == '/api/shutdown':
                 video_tasks.cancel_all()
                 self._send_json({'ok': True})
+                on_shutdown = getattr(self.server, 'on_shutdown', None)
+                if callable(on_shutdown):
+                    threading.Thread(target=on_shutdown, daemon=True).start()
                 threading.Thread(target=self.server.shutdown, daemon=True).start()
                 return
 
@@ -588,6 +600,7 @@ def create_server(start_port=DEFAULT_PORT):
             httpd.daemon_threads = True
             httpd.api_token = secrets.token_hex(16)
             httpd.allowed_paths = set()
+            httpd.on_shutdown = None
             return httpd, port
         except OSError:
             continue

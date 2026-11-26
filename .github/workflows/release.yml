@@ -1,0 +1,61 @@
+name: Build & Release DeskKit EXE
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: '可选：填写版本号（如 v1.1.0）自动创建 Release；留空则仅生成免安装 exe 产物'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 配置 Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 安装依赖与 PyInstaller
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: 运行全套单元测试
+        run: python -m unittest discover -s tests -v
+
+      - name: 打包绿色免安装单文件 DeskKit.exe
+        shell: cmd
+        run: |
+          pyinstaller --noconfirm --clean --onefile --windowed ^
+            --name DeskKit ^
+            --add-data "web;web" ^
+            --hidden-import pillow_heif ^
+            --hidden-import pdf2docx ^
+            --hidden-import pymupdf ^
+            launch.pyw
+
+      - name: 上传构建产物（可在 Actions 页面直接下载）
+        uses: actions/upload-artifact@v4
+        with:
+          name: DeskKit-Windows-x64
+          path: dist/DeskKit.exe
+
+      - name: 发布到 GitHub Releases
+        if: startsWith(github.ref, 'refs/tags/v') || inputs.release_tag != ''
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag != '' && inputs.release_tag || github.ref_name }}
+          name: DeskKit ${{ inputs.release_tag != '' && inputs.release_tag || github.ref_name }}
+          generate_release_notes: true
+          files: dist/DeskKit.exe

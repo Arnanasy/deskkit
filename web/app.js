@@ -93,15 +93,42 @@ async function api(url, body) {
   return data;
 }
 
-async function uploadFile(file) {
-  const res = await fetch(`/api/upload?name=${encodeURIComponent(file.name)}`, {
-    method: 'POST',
-    headers: { 'X-Toolbox-Token': API_TOKEN },
-    body: file,
+function uploadFile(file) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', `/api/upload?name=${encodeURIComponent(file.name)}`);
+    xhr.setRequestHeader('X-Toolbox-Token', API_TOKEN);
+    const isLarge = file.size >= 25 * 1024 * 1024;
+    const isHuge = file.size >= 300 * 1024 * 1024;
+    let lastBucket = -1;
+    if (isLarge && xhr.upload) {
+      xhr.upload.onprogress = (ev) => {
+        if (!ev.lengthComputable) return;
+        const pct = Math.min(99, Math.round((ev.loaded / ev.total) * 100));
+        const bucket = Math.floor(pct / 5);
+        if (bucket !== lastBucket) {
+          lastBucket = bucket;
+          toast(isHuge
+            ? `正在导入大文件 ${pct}%（提示：点“📁 选本机文件”可零拷贝秒读）`
+            : `正在导入文件 ${pct}%…`);
+        }
+      };
+    }
+    xhr.onload = () => {
+      try {
+        const data = JSON.parse(xhr.responseText || '{}');
+        if (xhr.status >= 200 && xhr.status < 300 && !data.error) {
+          resolve(data);
+        } else {
+          reject(new Error(data.error || `上传失败 (${xhr.status})`));
+        }
+      } catch (_) {
+        reject(new Error(`上传响应解析失败 (${xhr.status})`));
+      }
+    };
+    xhr.onerror = () => reject(new Error('上传网络异常'));
+    xhr.send(file);
   });
-  const data = await res.json();
-  if (!res.ok || data.error) throw new Error(data.error || '上传失败');
-  return data;
 }
 
 function openPath(p) {
@@ -346,9 +373,11 @@ function pollVideoTask(task, ui, pollKey, taskKey = 'videoTaskId') {
   state[taskKey] = task.id;
   ui.box.style.display = 'block';
   ui.desc.textContent = task.mode_desc;
-  ui.bar.style.width = '2%';
+  ui.bar.style.width = task.status === 'queued' ? '0%' : '2%';
   ui.stat.className = 'badge badge-info';
-  ui.stat.textContent = '启动中…';
+  ui.stat.textContent = task.status === 'queued'
+    ? `排队等待中（第 ${task.queue_pos || 1} 位）…`
+    : '启动中…';
   ui.actions.innerHTML = `<button class="btn btn-sm btn-danger js-v-cancel">取消任务</button>`;
   ui.preview.innerHTML = '';
   ui.actions.querySelector('.js-v-cancel').onclick = () => api('/api/video/cancel', { id: task.id });
@@ -356,8 +385,11 @@ function pollVideoTask(task, ui, pollKey, taskKey = 'videoTaskId') {
   state[pollKey] = setInterval(async () => {
     try {
       const cur = await api(`/api/video/task/${task.id}`);
-      ui.bar.style.width = `${cur.progress}%`;
-      if (cur.status === 'running') {
+      if (cur.status === 'queued') {
+        ui.bar.style.width = '0%';
+        ui.stat.textContent = `排队等待中（第 ${cur.queue_pos || 1} 位）…`;
+      } else if (cur.status === 'running') {
+        ui.bar.style.width = `${Math.max(2, cur.progress)}%`;
         ui.stat.textContent = `${cur.progress}%${cur.speed ? ' · ' + cur.speed : ''}`;
       } else {
         clearInterval(state[pollKey]);

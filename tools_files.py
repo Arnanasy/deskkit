@@ -16,6 +16,7 @@ import zlib
 OUTPUT_DIR = Path.home() / 'Downloads' / '工具箱输出'
 UPLOAD_DIR = Path(tempfile.gettempdir()) / 'local_toolbox_uploads'
 UPLOAD_PREFIX = '__tb_'
+IS_FROZEN = getattr(sys, 'frozen', False)
 
 
 def is_within(path, root):
@@ -115,16 +116,44 @@ def open_in_explorer(path_str):
         os.startfile(str(target))
 
 
-def _run_dialog_script(script, payload):
-    """通过独立子进程执行文件/文件夹弹窗，并用临时 UTF-8 JSON 文件回传结果（兼容 pythonw 无 stdout）。"""
+def run_tk_dialog_from_args(kind, payload_json, out_file_str):
+    """在独立子进程内弹出高 DPI 系统文件/文件夹选择框，并将结果以 UTF-8 JSON 写入临时文件。"""
+    import ctypes
+    import tkinter as tk
+    from tkinter import filedialog
+    try:
+        ctypes.WinDLL('shcore').SetProcessDpiAwareness(2)
+    except Exception:
+        pass
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes('-topmost', True)
+    cfg = json.loads(payload_json)
+    if kind == 'files':
+        fts = [tuple(x) for x in (cfg.get('filetypes') or [('所有文件', '*.*')])]
+        if cfg.get('multiple'):
+            res = list(filedialog.askopenfilenames(title=cfg.get('title', '选择文件'), filetypes=fts))
+        else:
+            p = filedialog.askopenfilename(title=cfg.get('title', '选择文件'), filetypes=fts)
+            res = [p] if p else []
+    else:
+        res = filedialog.askdirectory(title=cfg.get('title', '选择文件夹')) or ''
+    Path(out_file_str).write_text(json.dumps(res, ensure_ascii=False), encoding='utf-8')
+    root.destroy()
+
+
+def _run_dialog_subprocess(kind, payload):
+    """通过独立子进程执行文件/文件夹弹窗（同时兼容源码脚本与 PyInstaller 单文件 exe）。"""
     ensure_dirs()
     out_file = UPLOAD_DIR / f'dialog_{uuid.uuid4().hex[:8]}.json'
     creationflags = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+    payload_str = json.dumps(payload, ensure_ascii=False)
+    if IS_FROZEN:
+        cmd = [sys.executable, '--dialog', kind, payload_str, str(out_file)]
+    else:
+        cmd = [sys.executable, '-B', str(Path(__file__).resolve()), '--dialog', kind, payload_str, str(out_file)]
     try:
-        subprocess.run(
-            [sys.executable, '-B', '-c', script, json.dumps(payload, ensure_ascii=False), str(out_file)],
-            creationflags=creationflags,
-        )
+        subprocess.run(cmd, creationflags=creationflags)
         if out_file.exists():
             return json.loads(out_file.read_text(encoding='utf-8'))
     finally:
@@ -133,40 +162,15 @@ def _run_dialog_script(script, payload):
 
 
 def pick_files(title='选择文件', filetypes=None, multiple=False):
-    """通过独立 Python 子进程调用系统文件选择框，避免在 HTTP 线程操作 Tk 死锁。"""
+    """通过独立子进程调用系统文件选择框，避免在 HTTP 线程操作 Tk 死锁。"""
     filetypes = filetypes or [('所有文件', '*.*')]
-    script = (
-        'import ctypes, json, pathlib, sys, tkinter as tk\n'
-        'from tkinter import filedialog\n'
-        'try: ctypes.WinDLL("shcore").SetProcessDpiAwareness(2)\n'
-        'except Exception: pass\n'
-        'root = tk.Tk(); root.withdraw(); root.attributes("-topmost", True)\n'
-        'cfg = json.loads(sys.argv[1])\n'
-        'fts = [tuple(x) for x in cfg["filetypes"]]\n'
-        'if cfg["multiple"]:\n'
-        '    res = list(filedialog.askopenfilenames(title=cfg["title"], filetypes=fts))\n'
-        'else:\n'
-        '    p = filedialog.askopenfilename(title=cfg["title"], filetypes=fts)\n'
-        '    res = [p] if p else []\n'
-        'pathlib.Path(sys.argv[2]).write_text(json.dumps(res, ensure_ascii=False), encoding="utf-8")\n'
-    )
-    res = _run_dialog_script(script, {'title': title, 'filetypes': filetypes, 'multiple': multiple})
+    res = _run_dialog_subprocess('files', {'title': title, 'filetypes': filetypes, 'multiple': bool(multiple)})
     return res if isinstance(res, list) else []
 
 
 def pick_folder(title='选择文件夹'):
     """调用系统文件夹选择框。"""
-    script = (
-        'import ctypes, json, pathlib, sys, tkinter as tk\n'
-        'from tkinter import filedialog\n'
-        'try: ctypes.WinDLL("shcore").SetProcessDpiAwareness(2)\n'
-        'except Exception: pass\n'
-        'root = tk.Tk(); root.withdraw(); root.attributes("-topmost", True)\n'
-        'cfg = json.loads(sys.argv[1])\n'
-        'p = filedialog.askdirectory(title=cfg["title"])\n'
-        'pathlib.Path(sys.argv[2]).write_text(json.dumps(p or "", ensure_ascii=False), encoding="utf-8")\n'
-    )
-    res = _run_dialog_script(script, {'title': title})
+    res = _run_dialog_subprocess('folder', {'title': title})
     return res if isinstance(res, str) else ''
 
 
@@ -533,3 +537,7 @@ def calc_file_hash(path_str):
         'sha256': sha256.hexdigest(),
         'crc32': f'{crc & 0xffffffff:08x}',
     }
+
+
+if __name__ == '__main__' and len(sys.argv) >= 5 and sys.argv[1] == '--dialog':
+    run_tk_dialog_from_args(sys.argv[2], sys.argv[3], sys.argv[4])

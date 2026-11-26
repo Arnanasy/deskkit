@@ -360,13 +360,38 @@ class TestToolsVideo(unittest.TestCase):
         self.assertEqual(tools_video._time_to_seconds('01:02:03.5'), 3723.5)
         self.assertEqual(tools_video._time_to_seconds('bad'), 0.0)
 
-    def test_video_task_manager_enforces_concurrency_limit(self):
+    def test_video_task_manager_queues_and_cancels_cleanly(self):
         mgr = tools_video.VideoTaskManager()
         mgr._tasks['existing'] = {'id': 'existing', 'status': 'running', 'started_at': 0}
-        with mock.patch.object(tools_video, 'ffmpeg_bins', return_value=('ffmpeg', 'ffprobe')):
-            with self.assertRaises(RuntimeError) as ctx:
-                mgr.start('dummy.mp4', 'compat')
-            self.assertIn('正在处理中', str(ctx.exception))
+        mgr._worker_alive = True
+        fake_info = {
+            'duration': 8.0, 'can_remux_video': True, 'can_remux_audio': True,
+            'audio_codec': 'aac', 'size_bytes': 2048,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            cn_dir = Path(tmp) / '中文视频目录'
+            cn_dir.mkdir()
+            src = cn_dir / '测试片段.mp4'
+            src.write_bytes(b'00')
+            with mock.patch.object(tools_video, 'ffmpeg_bins', return_value=('ffmpeg', 'ffprobe')), \
+                 mock.patch.object(tools_video, 'probe_video', return_value=fake_info):
+                t1 = mgr.start(str(src), 'compat', {'output_dir': str(cn_dir)})
+                t2 = mgr.start(str(src), 'compat', {'output_dir': str(cn_dir)})
+                self.assertEqual(t1['status'], 'queued')
+                self.assertEqual(t1['queue_pos'], 1)
+                self.assertEqual(t2['status'], 'queued')
+                self.assertEqual(t2['queue_pos'], 2)
+
+                # 取消排第 1 位的任务后，第 2 位应自动递补为第 1 位
+                self.assertTrue(mgr.cancel(t1['id']))
+                self.assertEqual(mgr.get(t1['id'])['status'], 'cancelled')
+                self.assertEqual(mgr.get(t2['id'])['queue_pos'], 1)
+
+                # 超出队列上限应给出友好报错
+                mgr.MAX_QUEUE = 1
+                with self.assertRaises(RuntimeError) as ctx:
+                    mgr.start(str(src), 'compat', {'output_dir': str(cn_dir)})
+                self.assertIn('上限', str(ctx.exception))
 
     def test_video_rotate_command_and_merge_validation(self):
         mgr = tools_video.VideoTaskManager()
@@ -453,6 +478,52 @@ class TestToolsVideo(unittest.TestCase):
             res = tools_video.export_video_frames(str(clip), mode='interval', interval=5.0, fmt='jpg', out_dir=base)
             self.assertGreaterEqual(res['count'], 1)
             self.assertTrue(Path(res['path']).exists())
+
+
+class TestServerAndTray(unittest.TestCase):
+    """系统托盘图标生成与本地 HTTP 服务 Host / Token 安全拦截验证。"""
+
+    def test_tray_icon_gdi_creation(self):
+        import tray
+        hicon = tray._make_toolbox_icon()
+        self.assertTrue(bool(hicon))
+        tray.user32.DestroyIcon(hicon)
+
+    def test_server_host_and_csrf_token_protection(self):
+        import json
+        import threading
+        from urllib.error import HTTPError
+        from urllib.request import Request, urlopen
+        import server
+
+        httpd, port = server.create_server(18700)
+        t = threading.Thread(target=httpd.serve_forever, daemon=True)
+        t.start()
+        try:
+            # 1. 正常健康检查
+            with urlopen(f'http://127.0.0.1:{port}/api/health', timeout=3) as resp:
+                data = json.loads(resp.read().decode('utf-8'))
+                self.assertTrue(data['ok'])
+
+            # 2. 伪造 Host 头应被 403 拦截（防 DNS Rebinding）
+            bad_host_req = Request(f'http://127.0.0.1:{port}/api/health', headers={'Host': 'evil.example.com'})
+            with self.assertRaises(HTTPError) as ctx1:
+                urlopen(bad_host_req, timeout=3)
+            self.assertEqual(ctx1.exception.code, 403)
+
+            # 3. 缺少 X-Toolbox-Token 的 POST 请求应被 403 拦截（防 CSRF）
+            no_tok_req = Request(
+                f'http://127.0.0.1:{port}/api/rename/preview',
+                data=b'{}',
+                headers={'Content-Type': 'application/json'},
+                method='POST',
+            )
+            with self.assertRaises(HTTPError) as ctx2:
+                urlopen(no_tok_req, timeout=3)
+            self.assertEqual(ctx2.exception.code, 403)
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
 
 
 if __name__ == '__main__':
