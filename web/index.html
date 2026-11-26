@@ -187,7 +187,7 @@
         <div class="subpanel" id="v-gif">
           <div class="grid-2" style="margin-bottom:12px;">
             <div class="field"><label>开始时间</label><input type="text" id="vgif-start" placeholder="00:00:00"></div>
-            <div class="field"><label>结束时间（建议 10 秒以内）</label><input type="text" id="vgif-end" placeholder="00:00:06"></div>
+            <div class="field"><label>结束时间（留空默认截取 6 秒，上限 30 秒）</label><input type="text" id="vgif-end" placeholder="00:00:06"></div>
             <div class="field"><label>宽度（像素）</label><input type="number" id="vgif-width" value="480" min="160" max="960"></div>
             <div class="field"><label>帧率（FPS）</label><input type="number" id="vgif-fps" value="12" min="5" max="24"></div>
           </div>
@@ -215,16 +215,15 @@
           <button class="btn btn-primary" id="btn-run-frames">📸 批量导出截图</button>
           <div id="v-frames-result"></div>
         </div>
+      </div>
 
-        <div id="video-progress-box" style="display:none; margin-top:16px; padding-top:14px; border-top:1px solid var(--border);">
-          <div class="row" style="justify-content:space-between;">
-            <span id="vp-desc">处理中…</span>
-            <span id="vp-stat" class="badge badge-info">0%</span>
-          </div>
-          <div class="progress-wrap"><div class="progress-bar" id="vp-bar"></div></div>
-          <div class="row" id="vp-actions"></div>
-          <div id="vp-preview"></div>
+      <!-- 视频多任务排队与结果面板（移除上方待选视频不影响此处正在转码或排队的任务） -->
+      <div class="card" id="video-tasks-card" style="display:none;">
+        <div class="row" style="justify-content:space-between; margin-bottom:10px;">
+          <h3 style="margin:0;">🎬 视频任务队列</h3>
+          <button class="btn btn-sm" id="btn-vtasks-clear-done">清理已结束任务</button>
         </div>
+        <div class="task-list" id="video-task-list"></div>
       </div>
 
       <!-- 多视频合并 与 字幕格式互转（无需先选主视频） -->
@@ -249,15 +248,6 @@
             <label class="checkbox-row"><input type="checkbox" id="vmerge-nvenc" checked> 启用显卡硬件加速 (NVENC)</label>
           </div>
           <button class="btn btn-primary" id="btn-run-vmerge">🎞️ 开始合并视频</button>
-          <div id="vmerge-progress-box" style="display:none; margin-top:14px; padding-top:12px; border-top:1px solid var(--border);">
-            <div class="row" style="justify-content:space-between;">
-              <span id="vmp-desc">合并中…</span>
-              <span id="vmp-stat" class="badge badge-info">0%</span>
-            </div>
-            <div class="progress-wrap"><div class="progress-bar" id="vmp-bar"></div></div>
-            <div class="row" id="vmp-actions"></div>
-            <div id="vmp-preview"></div>
-          </div>
         </div>
 
         <div class="subpanel" id="v-sub">

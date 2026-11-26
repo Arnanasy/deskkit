@@ -190,9 +190,9 @@ def stitch_images(paths, mode='vertical', gap=0, bg_color='#ffffff', cols=2, out
     imgs = [_open_oriented(Path(p)).convert('RGBA') for p in paths]
     try:
         if mode == 'vertical':
-            target_w = max(im.width for im in imgs)
+            target_w = max(1, max(im.width for im in imgs))
             resized = [
-                im.resize((target_w, round(im.height * target_w / im.width)), Image.Resampling.LANCZOS)
+                im.resize((target_w, max(1, round(im.height * target_w / max(1, im.width)))), Image.Resampling.LANCZOS)
                 if im.width != target_w else im
                 for im in imgs
             ]
@@ -204,9 +204,9 @@ def stitch_images(paths, mode='vertical', gap=0, bg_color='#ffffff', cols=2, out
                 canvas.paste(im, (0, y), im)
                 y += im.height + gap
         elif mode == 'horizontal':
-            target_h = max(im.height for im in imgs)
+            target_h = max(1, max(im.height for im in imgs))
             resized = [
-                im.resize((round(im.width * target_h / im.height), target_h), Image.Resampling.LANCZOS)
+                im.resize((max(1, round(im.width * target_h / max(1, im.height))), target_h), Image.Resampling.LANCZOS)
                 if im.height != target_h else im
                 for im in imgs
             ]
@@ -218,9 +218,9 @@ def stitch_images(paths, mode='vertical', gap=0, bg_color='#ffffff', cols=2, out
                 canvas.paste(im, (x, 0), im)
                 x += im.width + gap
         else:
-            # 宫格拼接：统一缩放到同一格子尺寸
-            cell_w = min(max(im.width for im in imgs), 1200)
-            cell_h = round(cell_w * (imgs[0].height / imgs[0].width))
+            # 宫格拼接：统一缩放到同一格子尺寸（极端长宽比下至少保持 1px）
+            cell_w = max(1, min(max(im.width for im in imgs), 1200))
+            cell_h = max(1, round(cell_w * (imgs[0].height / max(1, imgs[0].width))))
             rows = math.ceil(len(imgs) / cols)
             total_w = cols * cell_w + gap * (cols - 1)
             total_h = rows * cell_h + gap * (rows - 1)
@@ -359,17 +359,24 @@ def split_image(path_str, mode='vertical', parts=3, rows=3, cols=3,
         else:
             raise ValueError(f'不支持的切图模式: {mode}')
 
-        for idx, box in enumerate(boxes, 1):
-            piece = img.crop(box)
-            p = unique_path(out_dir, f'{stem}_切片{idx:02d}', ext)
-            _save_image(piece, p, fmt, quality=92)
-            piece.close()
-            out_paths.append(p)
+        zip_path = unique_path(out_dir, f'{stem}_分割_{len(boxes)}张', '.zip')
+        try:
+            with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED) as zf:
+                for idx, box in enumerate(boxes, 1):
+                    piece = img.crop(box)
+                    try:
+                        buf = io.BytesIO()
+                        _save_image(piece, buf, fmt, quality=92)
+                        zf.writestr(f'{stem}_切片{idx:02d}{ext}', buf.getvalue())
+                    finally:
+                        piece.close()
+        except Exception:
+            zip_path.unlink(missing_ok=True)
+            raise
 
-    zip_path = _bundle_zip(out_dir, out_paths, f'{stem}_分割_{len(out_paths)}张')
     return {
-        'count': len(out_paths),
-        'first_path': str(out_paths[0]),
+        'count': len(boxes),
+        'first_path': '',
         'zip_path': str(zip_path),
         'zip_name': zip_path.name,
         'output_size': zip_path.stat().st_size,

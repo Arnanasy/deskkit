@@ -19,6 +19,15 @@ kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
 gdi32 = ctypes.WinDLL('gdi32', use_last_error=True)
 shell32 = ctypes.WinDLL('shell32', use_last_error=True)
 
+# 开启高 DPI 感知，防止高分屏下托盘右键菜单与字体发虚模糊
+try:
+    ctypes.WinDLL('shcore').SetProcessDpiAwareness(2)
+except (OSError, AttributeError):
+    try:
+        user32.SetProcessDPIAware()
+    except (OSError, AttributeError):
+        pass
+
 WM_DESTROY = 0x0002
 WM_CLOSE = 0x0010
 WM_NULL = 0x0000
@@ -145,8 +154,9 @@ _sig(shell32.Shell_NotifyIconW, wintypes.BOOL, wintypes.DWORD, ctypes.POINTER(NO
 
 
 def _make_toolbox_icon():
-    """用 GDI 绘制圆角蓝色背景 + 白色小工具箱图标（无外部 ico 文件时使用）。"""
-    size = 32
+    """用 GDI 绘制圆角蓝色背景 + 白色小工具箱图标（随系统高分屏 DPI 自动缩放，边缘清晰）。"""
+    size = max(32, user32.GetSystemMetrics(SM_CXSMICON) * 2)
+    sc = lambda v: round(v * size / 32)
     screen_dc = user32.GetDC(None)
     color_bmp = gdi32.CreateCompatibleBitmap(screen_dc, size, size)
     mask_bits = ctypes.create_string_buffer(((size + 15) // 16) * 2 * size)
@@ -158,20 +168,20 @@ def _make_toolbox_icon():
     blue = gdi32.CreateSolidBrush(0x00EB6325)   # #2563EB (BGR)
     white = gdi32.CreateSolidBrush(0x00FFFFFF)
     old_brush = gdi32.SelectObject(mem_dc, blue)
-    gdi32.RoundRect(mem_dc, 0, 0, size, size, 9, 9)
+    gdi32.RoundRect(mem_dc, 0, 0, size, size, sc(9), sc(9))
 
     # 白色工具箱提手与箱体
     gdi32.SelectObject(mem_dc, white)
-    gdi32.Rectangle(mem_dc, 11, 6, 21, 11)
+    gdi32.Rectangle(mem_dc, sc(11), sc(6), sc(21), sc(11))
     gdi32.SelectObject(mem_dc, blue)
-    gdi32.Rectangle(mem_dc, 13, 8, 19, 11)
+    gdi32.Rectangle(mem_dc, sc(13), sc(8), sc(19), sc(11))
     gdi32.SelectObject(mem_dc, white)
-    gdi32.Rectangle(mem_dc, 6, 11, 26, 25)
+    gdi32.Rectangle(mem_dc, sc(6), sc(11), sc(26), sc(25))
     # 中间分隔条与锁扣
     gdi32.SelectObject(mem_dc, blue)
-    gdi32.Rectangle(mem_dc, 6, 16, 26, 18)
+    gdi32.Rectangle(mem_dc, sc(6), sc(16), sc(26), sc(18))
     gdi32.SelectObject(mem_dc, white)
-    gdi32.Rectangle(mem_dc, 14, 15, 18, 19)
+    gdi32.Rectangle(mem_dc, sc(14), sc(15), sc(18), sc(19))
 
     gdi32.SelectObject(mem_dc, old_brush)
     gdi32.SelectObject(mem_dc, old_pen)

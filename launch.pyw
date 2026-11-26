@@ -1,5 +1,6 @@
 """静默启动 DeskKit 本地服务、驻留右下角系统托盘并在浏览器打开；若已在运行则直接复用现有实例。"""
 import ctypes
+import json
 from pathlib import Path
 import sys
 import threading
@@ -21,7 +22,7 @@ if len(sys.argv) >= 5 and sys.argv[1] == '--dialog':
     sys.exit(0)
 
 from server import DEFAULT_PORT, PORT_SPAN, create_server
-from tools_files import OUTPUT_DIR, open_in_explorer
+from tools_files import OUTPUT_DIR, cleanup_old_uploads, open_in_explorer
 from tools_video import video_tasks
 from tray import DeskKitTray
 
@@ -29,10 +30,12 @@ from tray import DeskKitTray
 def _running_port():
     for port in range(DEFAULT_PORT, DEFAULT_PORT + PORT_SPAN):
         try:
-            with urlopen(f'http://127.0.0.1:{port}/api/health', timeout=0.35) as resp:
+            with urlopen(f'http://127.0.0.1:{port}/api/health', timeout=0.2) as resp:
                 if resp.status == 200:
-                    return port
-        except OSError:
+                    data = json.loads(resp.read(4096).decode('utf-8', 'replace'))
+                    if isinstance(data, dict) and data.get('ok') is True:
+                        return port
+        except (OSError, ValueError):
             continue
     return None
 
@@ -61,6 +64,7 @@ def main():
         tray.run()
     finally:
         video_tasks.cancel_all()
+        cleanup_old_uploads(max_age_seconds=0)
         try:
             httpd.shutdown()
         except Exception:

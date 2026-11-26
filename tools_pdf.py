@@ -156,19 +156,21 @@ def edit_pages(path_str, action, pages_expr='', angle=90, out_dir=None):
         if action == 'split_all':
             if not selected:
                 raise ValueError('未匹配到任何有效页码')
-            out_paths = []
-            for idx in selected:
-                p = unique_path(out_dir, f'{stem}_第{idx + 1}页', '.pdf')
-                single = pymupdf.open()
-                single.insert_pdf(doc, from_page=idx, to_page=idx)
-                single.save(p, garbage=3, deflate=True)
-                single.close()
-                out_paths.append(p)
             zip_path = unique_path(out_dir, f'{stem}_拆分全部', '.zip')
-            with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED) as zf:
-                for p in out_paths:
-                    zf.write(p, arcname=p.name)
-            return {'name': zip_path.name, 'path': str(zip_path), 'pages': len(out_paths),
+            try:
+                with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED) as zf:
+                    for idx in selected:
+                        single = pymupdf.open()
+                        try:
+                            single.insert_pdf(doc, from_page=idx, to_page=idx)
+                            pdf_bytes = single.tobytes(garbage=3, deflate=True)
+                        finally:
+                            single.close()
+                        zf.writestr(f'{stem}_第{idx + 1}页.pdf', pdf_bytes)
+            except Exception:
+                zip_path.unlink(missing_ok=True)
+                raise
+            return {'name': zip_path.name, 'path': str(zip_path), 'pages': len(selected),
                     'output_size': zip_path.stat().st_size, 'output_dir': str(out_dir)}
 
         raise ValueError(f'不支持的 PDF 操作: {action}')
@@ -178,31 +180,35 @@ def pdf_to_images(path_str, fmt='png', dpi=150, pages_expr='', out_dir=None):
     out_dir = Path(out_dir or OUTPUT_DIR)
     stem = _clean_stem(path_str)
     dpi = max(72, min(300, int(dpi or 150)))
-    ext = '.jpg' if fmt.lower() in ('jpg', 'jpeg') else '.png'
+    is_jpg = fmt.lower() in ('jpg', 'jpeg')
+    ext = '.jpg' if is_jpg else '.png'
+    pix_fmt = 'jpeg' if is_jpg else 'png'
 
-    out_paths = []
     with pymupdf.open(path_str) as doc:
         _ensure_unlocked(doc)
         selected = parse_pages(pages_expr, len(doc))
         if not selected:
             raise ValueError('未匹配到任何有效页码')
-        for idx in selected:
+
+        if len(selected) == 1:
+            idx = selected[0]
             pix = doc[idx].get_pixmap(dpi=dpi, alpha=False)
             p = unique_path(out_dir, f'{stem}_p{idx + 1}', ext)
             pix.save(str(p))
-            out_paths.append(p)
+            return {'name': p.name, 'path': str(p), 'count': 1,
+                    'output_size': p.stat().st_size, 'output_dir': str(out_dir)}
 
-    if len(out_paths) == 1:
-        p = out_paths[0]
-        return {'name': p.name, 'path': str(p), 'count': 1,
-                'output_size': p.stat().st_size, 'output_dir': str(out_dir)}
-
-    zip_path = unique_path(out_dir, f'{stem}_导出图片', '.zip')
-    with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED) as zf:
-        for p in out_paths:
-            zf.write(p, arcname=p.name)
-    return {'name': zip_path.name, 'path': str(zip_path), 'count': len(out_paths),
-            'output_size': zip_path.stat().st_size, 'output_dir': str(out_dir)}
+        zip_path = unique_path(out_dir, f'{stem}_导出图片', '.zip')
+        try:
+            with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED) as zf:
+                for idx in selected:
+                    pix = doc[idx].get_pixmap(dpi=dpi, alpha=False)
+                    zf.writestr(f'{stem}_p{idx + 1:03d}{ext}', pix.tobytes(pix_fmt))
+        except Exception:
+            zip_path.unlink(missing_ok=True)
+            raise
+        return {'name': zip_path.name, 'path': str(zip_path), 'count': len(selected),
+                'output_size': zip_path.stat().st_size, 'output_dir': str(out_dir)}
 
 
 def images_to_pdf(paths, out_dir=None):
@@ -270,28 +276,57 @@ def compress_pdf(path_str, level='balanced', out_dir=None):
 
 
 def _word_convert(src_path, dst_path, wd_format):
-    """通过独立 PowerShell STA 进程调用本机 Microsoft Word COM 导出 PDF（超时精准清理本次拉起的 WINWORD 进程）。"""
+    """通过独立 PowerShell STA 进程调用本机 Microsoft Word COM 导出 PDF。
+
+    若检测到用户已在桌面打开 Word，则以无窗只读模式借用转换，绝不隐藏用户窗口、不关闭用户已打开文档、也不强退 Word。
+    """
     import tempfile
     import uuid
 
     pid_file = Path(tempfile.gettempdir()) / f'toolbox_word_{uuid.uuid4().hex[:8]}.pid'
     ps_script = (
         '$ErrorActionPreference = "Stop"\n'
-        '$src = $args[0]; $dst = $args[1]; $fmt = [int]$args[2]; $pidFile = $args[3]\n'
-        '$word = $null; $doc = $null\n'
+        '$src = [System.IO.Path]::GetFullPath($args[0]); $dst = [System.IO.Path]::GetFullPath($args[1])\n'
+        '$fmt = [int]$args[2]; $pidFile = $args[3]\n'
+        '$word = $null; $openedDoc = $null; $reused = $false; $origAlerts = $null\n'
         'try {\n'
         '    $before = @(Get-Process -Name WINWORD -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id)\n'
         '    $word = New-Object -ComObject Word.Application\n'
         '    $after = @(Get-Process -Name WINWORD -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id)\n'
-        '    $newPids = $after | Where-Object { $before -notcontains $_ }\n'
-        '    if ($newPids) { ($newPids -join ",") | Set-Content -Path $pidFile -Encoding ASCII }\n'
-        '    $word.Visible = $false\n'
+        '    $newPids = @($after | Where-Object { $before -notcontains $_ })\n'
+        '    $reused = ($newPids.Count -eq 0) -or ($word.Visible -eq $true) -or ($word.Documents.Count -gt 0)\n'
+        '    if (-not $reused -and $newPids.Count -gt 0) {\n'
+        '        ($newPids -join ",") | Set-Content -Path $pidFile -Encoding ASCII\n'
+        '    }\n'
+        '    $origAlerts = $word.DisplayAlerts\n'
+        '    if (-not $reused) { $word.Visible = $false }\n'
         '    $word.DisplayAlerts = 0\n'
-        '    $doc = $word.Documents.Open($src, $false, $true, $false)\n'
-        '    $doc.ExportAsFixedFormat($dst, $fmt)\n'
+        '    $targetDoc = $null\n'
+        '    if ($reused) {\n'
+        '        foreach ($d in $word.Documents) {\n'
+        '            try {\n'
+        '                if ([string]::Equals([System.IO.Path]::GetFullPath($d.FullName), $src, [System.StringComparison]::OrdinalIgnoreCase)) {\n'
+        '                    $targetDoc = $d; break\n'
+        '                }\n'
+        '            } catch {}\n'
+        '        }\n'
+        '    }\n'
+        '    if ($null -eq $targetDoc) {\n'
+        '        $m = [System.Reflection.Missing]::Value\n'
+        '        $openedDoc = $word.Documents.Open($src, $false, $true, $false, $m, $m, $false, $m, $m, $m, $m, $false)\n'
+        '        $targetDoc = $openedDoc\n'
+        '    }\n'
+        '    $targetDoc.ExportAsFixedFormat($dst, $fmt)\n'
         '} finally {\n'
-        '    if ($doc) { try { $doc.Close($false) } catch {} }\n'
-        '    if ($word) { try { $word.Quit() } catch {} }\n'
+        '    if ($openedDoc) { try { $openedDoc.Close(0) } catch {} }\n'
+        '    if ($word) {\n'
+        '        if ($reused) {\n'
+        '            if ($null -ne $origAlerts) { try { $word.DisplayAlerts = $origAlerts } catch {} }\n'
+        '        } else {\n'
+        '            try { $word.Quit(0) } catch {}\n'
+        '        }\n'
+        '        try { [void][System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($word) } catch {}\n'
+        '    }\n'
         '}\n'
     )
     try:
@@ -379,10 +414,10 @@ def word_to_pdf(path_str, out_dir=None):
 
 
 def protect_pdf(path_str, user_pw='', owner_pw='', allow_print=True, allow_copy=True, out_dir=None):
-    """使用 AES-256 为 PDF 设置打开密码或打印/复制权限限制。"""
-    user_pw = (user_pw or '').strip()
-    owner_pw = (owner_pw or '').strip()
-    if not user_pw and not owner_pw:
+    """使用 AES-256 为 PDF 设置打开密码或打印/复制权限限制（原样保留密码字符，不做隐式裁剪）。"""
+    user_pw = '' if user_pw is None else str(user_pw)
+    owner_pw = '' if owner_pw is None else str(owner_pw)
+    if user_pw == '' and owner_pw == '':
         raise ValueError('请至少填写“打开密码”或“权限密码”之一')
     out_dir = Path(out_dir or OUTPUT_DIR)
     src = Path(path_str)

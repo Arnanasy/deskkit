@@ -546,6 +546,8 @@ class TestServerAndTray(unittest.TestCase):
         tok = httpd.api_token
         t = threading.Thread(target=httpd.serve_forever, daemon=True)
         t.start()
+        log_patcher = mock.patch.object(server, 'log')
+        log_patcher.start()
         try:
             # 1. /api/health 仅返回基础存活布尔值，不暴露本机路径
             with urlopen(f'http://127.0.0.1:{port}/api/health', timeout=3) as resp:
@@ -656,8 +658,9 @@ class TestServerAndTray(unittest.TestCase):
                     urlopen(huge_req, timeout=3)
                 self.assertEqual(ctx_413.exception.code, 413)
 
-                # 模拟内部抛出未预期 KeyError（含敏感路径），前端只能收到 500 通用脱敏提示
-                with mock.patch.object(server, 'calc_file_hash', side_effect=KeyError(r'C:\Users\secret_internal_key')):
+                # 模拟内部抛出未预期 KeyError（含敏感路径），前端只能收到 500 通用脱敏提示（静音测试日志避免污染真实 DeskKit_error.log）
+                with mock.patch.object(server, 'log'), \
+                     mock.patch.object(server, 'calc_file_hash', side_effect=KeyError(r'C:\Users\secret_internal_key')):
                     err_req = Request(
                         f'http://127.0.0.1:{port}/api/file/hash',
                         data=json.dumps({'path': str(uploaded_temp)}).encode('utf-8'),
@@ -673,8 +676,201 @@ class TestServerAndTray(unittest.TestCase):
                 if uploaded_temp is not None:
                     uploaded_temp.unlink(missing_ok=True)
         finally:
+            log_patcher.stop()
             httpd.shutdown()
             httpd.server_close()
+
+    def test_audit_fixes_gif_guard_queue_collision_pdf_space_pw_big5_sjis_and_http_keepalive(self):
+        """覆盖深度体检修复项：GIF内存保护、视频排队防覆盖误删、PDF空格密码与零散文件、Big5/日文识别、细长图拼图及HTTP长连接防粘包。"""
+        import http.client
+        import json
+        import threading
+        import server
+
+        # 1. 视频转 GIF：未填结束时间强制补齐 -t 6.000s，超 30s 报错，开始时间超总时长报错
+        mgr = tools_video.VideoTaskManager()
+        long_info = {
+            'duration': 1800.0, 'can_remux_video': True, 'can_remux_audio': True,
+            'audio_codec': 'aac', 'size_bytes': 10_000_000,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp) / '视频输出'
+            out_dir.mkdir()
+            cmd_gif, _, desc_gif, est_gif = mgr._build_command(
+                'ffmpeg', Path('半小时长片.mp4'), long_info, 'gif', {}, out_dir,
+            )
+            self.assertIn('-t', cmd_gif)
+            t_idx = cmd_gif.index('-t')
+            self.assertEqual(cmd_gif[t_idx + 1], '6.000')
+            self.assertEqual(est_gif, 6.0)
+
+            with self.assertRaises(ValueError):
+                mgr._build_command('ffmpeg', Path('半小时长片.mp4'), long_info, 'gif', {'start': '0', 'end': '45'}, out_dir)
+            with self.assertRaises(ValueError):
+                mgr._build_command('ffmpeg', Path('半小时长片.mp4'), long_info, 'gif', {'start': '1900'}, out_dir)
+
+            # 2. 视频排队原子输出名防碰撞覆盖 & 取消排队任务绝不误删磁盘已有成品
+            mgr2 = tools_video.VideoTaskManager()
+            mgr2._tasks['busy'] = {'id': 'busy', 'status': 'running', 'started_at': 0}
+            mgr2._worker_alive = True
+            src_v = out_dir / '样片.mp4'
+            src_v.write_bytes(b'00')
+            existing_done = out_dir / '样片_兼容.mp4'
+            existing_done.write_bytes(b'finished_video_data')
+
+            with mock.patch.object(tools_video, 'ffmpeg_bins', return_value=('ffmpeg', 'ffprobe')), \
+                 mock.patch.object(tools_video, 'probe_video', return_value=long_info):
+                q1 = mgr2.start(str(src_v), 'compat', {'output_dir': str(out_dir)})
+                q2 = mgr2.start(str(src_v), 'compat', {'output_dir': str(out_dir)})
+                q3 = mgr2.start(str(src_v), 'compat', {'output_dir': str(out_dir)})
+                self.assertEqual(
+                    [q1['output_name'], q2['output_name'], q3['output_name']],
+                    ['样片_兼容_2.mp4', '样片_兼容_3.mp4', '样片_兼容_4.mp4'],
+                )
+                # 取消 q1 后，已有成品与其余文件完好无损，且释放出的 _2 名称可被后续新任务复用
+                mgr2.cancel(q1['id'])
+                self.assertEqual(existing_done.read_bytes(), b'finished_video_data')
+                q4 = mgr2.start(str(src_v), 'compat', {'output_dir': str(out_dir)})
+                self.assertEqual(q4['output_name'], '样片_兼容_2.mp4')
+
+                # 60fps 视频重编码合并保留 fps=60
+                info_60 = dict(long_info, width=1920, height=1080, fps=60.0, video_codec='h264')
+                with mock.patch.object(tools_video, 'probe_video', return_value=info_60), \
+                     mock.patch.object(tools_video, 'has_nvenc', return_value=False):
+                    m_task = mgr2.start_merge([str(src_v), str(src_v)], {'reencode': True, 'output_dir': str(out_dir)})
+                    queued_cmd = [it[1] for it in mgr2._queue if it[0] == m_task['id']][0]
+                    fc_str = queued_cmd[queued_cmd.index('-filter_complex') + 1]
+                    self.assertIn('fps=60', fc_str)
+
+        # 3. PDF 首尾带空格密码原样加密与解锁 + 拆分/转多图/切图零散文件污染
+        with tempfile.TemporaryDirectory() as tmp:
+            p_dir = Path(tmp) / 'PDF整洁测试'
+            p_dir.mkdir()
+            src_pdf = p_dir / '三页文档.pdf'
+            doc = pymupdf.open()
+            for i in range(3):
+                pg = doc.new_page()
+                pg.insert_text((72, 72), f'Page {i + 1}')
+            doc.save(src_pdf)
+            doc.close()
+
+            out_sub = p_dir / 'out'
+            enc = tools_pdf.protect_pdf(str(src_pdf), user_pw='  space pw  ', out_dir=out_sub)
+            with self.assertRaises(ValueError):
+                tools_pdf.unlock_pdf(enc['path'], password='space pw', out_dir=out_sub)
+            dec = tools_pdf.unlock_pdf(enc['path'], password='  space pw  ', out_dir=out_sub)
+            self.assertEqual(tools_pdf.pdf_info(dec['path'])['pages'], 3)
+
+            split_out = p_dir / 'split_clean'
+            sp_res = tools_pdf.edit_pages(str(src_pdf), action='split_all', out_dir=split_out)
+            self.assertEqual([f.name for f in split_out.iterdir()], [Path(sp_res['path']).name])
+            with zipfile.ZipFile(sp_res['path']) as zf:
+                self.assertEqual(len(zf.namelist()), 3)
+
+            img_out = p_dir / 'img_clean'
+            pi_res = tools_pdf.pdf_to_images(str(src_pdf), fmt='png', out_dir=img_out)
+            self.assertEqual([f.name for f in img_out.iterdir()], [Path(pi_res['path']).name])
+            with zipfile.ZipFile(pi_res['path']) as zf:
+                self.assertEqual(len(zf.namelist()), 3)
+
+            # 切图零散文件污染 + 超宽细长条图片拼图防 0 像素崩溃
+            grid_out = p_dir / 'grid_clean'
+            tall_img = p_dir / 'tall.png'
+            Image.new('RGB', (90, 90), (20, 40, 80)).save(tall_img)
+            g_res = tools_image.split_image(str(tall_img), mode='grid', rows=3, cols=3, out_dir=grid_out)
+            self.assertEqual([f.name for f in grid_out.iterdir()], [Path(g_res['zip_path']).name])
+
+            thin = p_dir / 'thin.png'
+            small = p_dir / 'small.png'
+            Image.new('RGB', (1000, 1), (255, 0, 0)).save(thin)
+            Image.new('RGB', (50, 50), (0, 255, 0)).save(small)
+            for st_mode in ('vertical', 'horizontal', 'grid'):
+                st_res = tools_image.stitch_images([str(thin), str(small)], mode=st_mode, out_dir=p_dir)
+                self.assertGreaterEqual(st_res['width'], 1)
+                self.assertGreaterEqual(st_res['height'], 1)
+
+        # 4. 繁体 Big5 / 日文 Shift_JIS 乱码自动识别 + 下载目录迁移 + 含逗号文件定位
+        with tempfile.TemporaryDirectory() as tmp:
+            enc_dir = Path(tmp) / '多语种测试'
+            enc_dir.mkdir()
+            big5_txt = '繁體中文測試檔案，臺灣年度財務報告與資料彙整說明\n'
+            big5_file = enc_dir / 'big5_doc.txt'
+            big5_file.write_bytes(big5_txt.encode('big5'))
+            r_b5 = tools_files.fix_text_encoding(str(big5_file), source_encoding='auto', target_encoding='utf-8', out_dir=enc_dir)
+            self.assertEqual(r_b5['detected_encoding'], 'big5')
+            self.assertEqual(Path(r_b5['path']).read_text(encoding='utf-8'), big5_txt)
+
+            sjis_txt = '日本語のテキストファイルです。文字化けテスト確認と修正。\n'
+            sjis_file = enc_dir / 'sjis_doc.txt'
+            sjis_file.write_bytes(sjis_txt.encode('shift_jis'))
+            r_sj = tools_files.fix_text_encoding(str(sjis_file), source_encoding='auto', target_encoding='utf-8', out_dir=enc_dir)
+            self.assertEqual(r_sj['detected_encoding'], 'shift_jis')
+            self.assertEqual(Path(r_sj['path']).read_text(encoding='utf-8'), sjis_txt)
+
+            # 含英文逗号输出文件定位
+            comma_out = enc_dir / '报表,2026,终版.pdf'
+            comma_out.write_bytes(b'%PDF')
+            with mock.patch.object(tools_files, 'OUTPUT_DIR', enc_dir), \
+                 mock.patch.object(tools_files, '_select_file_via_shell', return_value=True) as sh_sel:
+                tools_files.open_in_explorer(str(comma_out))
+                sh_sel.assert_called_once_with(comma_out.resolve())
+
+        # 5. 路径脱敏正则（含空格目录与正斜杠）、只读目录日志回退与 HTTP/1.1 错误断连防粘包
+        san1 = server._sanitize_error_msg(r'无法打开 C:\Program Files\My App\secret file.docx: 权限不足')
+        self.assertNotIn('Program Files', san1)
+        self.assertNotIn('secret file', san1)
+        self.assertIn('<本地路径>', san1)
+
+        san2 = server._sanitize_error_msg('Read failed at D:/My Workspace/Private Folder/data.csv!')
+        self.assertNotIn('My Workspace', san2)
+        self.assertNotIn('Private Folder', san2)
+
+        with mock.patch.object(server.os, 'access', return_value=False):
+            fb_log = server._resolve_log_path()
+            self.assertEqual(fb_log.parent, Path(tempfile.gettempdir()))
+
+        httpd2, port2 = server.create_server(18730)
+        tok2 = httpd2.api_token
+        t2 = threading.Thread(target=httpd2.serve_forever, daemon=True)
+        t2.start()
+        try:
+            conn = http.client.HTTPConnection('127.0.0.1', port2, timeout=3)
+            try:
+                conn.request('POST', '/api/rename/preview', body=b'{"x": 123}', headers={'Content-Type': 'application/json'})
+                resp403 = conn.getresponse()
+                resp403.read()
+                self.assertEqual(resp403.status, 403)
+                self.assertEqual(resp403.getheader('Connection'), 'close')
+            finally:
+                conn.close()
+
+            # 6. /api/cleanup-uploads：清理闲置临时上传副本，但保护正在后台队列中的输入文件
+            tools_files.ensure_dirs()
+            idle_up = tools_files.UPLOAD_DIR / '__tb_deadbeef_idle.mp4'
+            busy_up = tools_files.UPLOAD_DIR / '__tb_deadbeef_busy.mp4'
+            idle_up.write_bytes(b'111')
+            busy_up.write_bytes(b'222')
+            try:
+                with mock.patch.object(server.video_tasks, 'active_input_paths', return_value={str(busy_up.resolve())}):
+                    c2 = http.client.HTTPConnection('127.0.0.1', port2, timeout=3)
+                    try:
+                        c2.request(
+                            'POST', '/api/cleanup-uploads',
+                            body=json.dumps({'paths': [str(idle_up), str(busy_up)]}).encode('utf-8'),
+                            headers={'Content-Type': 'application/json', 'X-Toolbox-Token': tok2},
+                        )
+                        r_clean = json.loads(c2.getresponse().read().decode('utf-8'))
+                        self.assertEqual(r_clean['removed'], 1)
+                        self.assertFalse(idle_up.exists())
+                        self.assertTrue(busy_up.exists())
+                    finally:
+                        c2.close()
+            finally:
+                idle_up.unlink(missing_ok=True)
+                busy_up.unlink(missing_ok=True)
+        finally:
+            httpd2.shutdown()
+            httpd2.server_close()
 
 
 if __name__ == '__main__':

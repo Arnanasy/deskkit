@@ -1,4 +1,5 @@
 """本机文件与目录管理：输出目录、临时上传、系统文件弹窗、打开目录、批量重命名、ZIP/文本乱码修复、文件哈希校验。"""
+import ctypes
 import hashlib
 import json
 import os
@@ -10,13 +11,33 @@ import sys
 import tempfile
 import time
 import uuid
+import winreg
 import zipfile
 import zlib
 
-OUTPUT_DIR = Path.home() / 'Downloads' / '工具箱输出'
+_SHELL_FOLDERS_KEY = r'Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders'
+_DOWNLOADS_GUID = '{374DE290-123F-4565-9164-39C4925E467B}'
+
+
+def _resolve_downloads_dir():
+    """读取系统注册表真实「下载」文件夹路径（兼容用户将下载目录迁移到 D/E 盘的场景）。"""
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _SHELL_FOLDERS_KEY) as key:
+            raw, _ = winreg.QueryValueEx(key, _DOWNLOADS_GUID)
+        if isinstance(raw, str) and raw.strip():
+            expanded = Path(os.path.expandvars(raw.strip()))
+            if expanded.exists() or expanded.anchor and Path(expanded.anchor).exists():
+                return expanded
+    except OSError:
+        pass
+    return Path.home() / 'Downloads'
+
+
+OUTPUT_DIR = _resolve_downloads_dir() / '工具箱输出'
 UPLOAD_DIR = Path(tempfile.gettempdir()) / 'local_toolbox_uploads'
 UPLOAD_PREFIX = '__tb_'
 IS_FROZEN = getattr(sys, 'frozen', False)
+_last_upload_cleanup = 0.0
 
 
 def is_within(path, root):
@@ -34,20 +55,51 @@ def ensure_dirs():
     return OUTPUT_DIR, UPLOAD_DIR
 
 
-def cleanup_old_uploads(max_age_seconds=86400):
-    """清理超过一天的临时上传文件，避免占用 C 盘空间。"""
+def cleanup_old_uploads(max_age_seconds=7200, protected_paths=None):
+    """清理过期的临时上传副本（跳过正在排队或处理中的活跃任务文件），防止长期占用 C 盘空间。"""
+    global _last_upload_cleanup
+    _last_upload_cleanup = time.monotonic()
     if not UPLOAD_DIR.exists():
-        return
+        return 0
+    protected = {
+        os.path.normcase(str(Path(p).resolve()))
+        for p in (protected_paths or ())
+        if p
+    }
     now = time.time()
+    removed = 0
     for item in UPLOAD_DIR.iterdir():
         try:
-            if now - item.stat().st_mtime > max_age_seconds:
+            norm = os.path.normcase(str(item.resolve()))
+            if norm in protected:
+                continue
+            if max_age_seconds <= 0 or (now - item.stat().st_mtime > max_age_seconds):
                 if item.is_dir():
                     shutil.rmtree(item, ignore_errors=True)
                 else:
                     item.unlink(missing_ok=True)
+                removed += 1
         except OSError:
             pass
+    return removed
+
+
+def maybe_cleanup_uploads(interval_seconds=600, max_age_seconds=7200, protected_paths=None):
+    """节流执行临时上传清理（运行期间每 10 分钟最多扫描一次）。"""
+    if time.monotonic() - _last_upload_cleanup >= interval_seconds:
+        cleanup_old_uploads(max_age_seconds=max_age_seconds, protected_paths=protected_paths)
+
+
+def touch_upload_if_temp(path_str):
+    """当访问或排队使用上传目录内的临时文件时，刷新其修改时间以避免中途被过期回收。"""
+    if not path_str:
+        return
+    try:
+        p = Path(path_str)
+        if p.is_file() and is_within(p, UPLOAD_DIR):
+            os.utime(p, None)
+    except OSError:
+        pass
 
 
 _WIN_RESERVED_NAMES = {
@@ -77,16 +129,17 @@ def clean_stem(path):
     return stem
 
 
-def unique_path(directory, stem, ext):
-    """在目标目录生成不重名的文件路径。"""
+def unique_path(directory, stem, ext, reserved=None):
+    """在目标目录生成不重名的文件路径（可选避开队列已预留但尚未落盘的路径集合）。"""
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     stem = safe_filename(stem)
     if ext and not ext.startswith('.'):
         ext = '.' + ext
+    reserved_norm = reserved if isinstance(reserved, set) else set()
     candidate = directory / f'{stem}{ext}'
     idx = 2
-    while candidate.exists():
+    while candidate.exists() or os.path.normcase(str(candidate.resolve())) in reserved_norm:
         candidate = directory / f'{stem}_{idx}{ext}'
         idx += 1
     return candidate
@@ -102,6 +155,41 @@ def save_upload(filename, data_bytes):
     return target
 
 
+def _select_file_via_shell(file_path):
+    """使用 Windows Shell PIDL 原生 API 打开文件夹并高亮文件（完美兼容含英文逗号、空格、等号的文件名）。"""
+    try:
+        ole32 = ctypes.WinDLL('ole32')
+        shell32 = ctypes.WinDLL('shell32')
+        ole32.CoInitializeEx.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        ole32.CoInitializeEx.restype = ctypes.c_long
+        ole32.CoUninitialize.argtypes = []
+        ole32.CoUninitialize.restype = None
+        shell32.ILCreateFromPathW.argtypes = [ctypes.c_wchar_p]
+        shell32.ILCreateFromPathW.restype = ctypes.c_void_p
+        shell32.ILFree.argtypes = [ctypes.c_void_p]
+        shell32.ILFree.restype = None
+        shell32.SHOpenFolderAndSelectItems.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p, ctypes.c_uint32,
+        ]
+        shell32.SHOpenFolderAndSelectItems.restype = ctypes.c_long
+
+        hr_init = ole32.CoInitializeEx(None, 0x2)
+        try:
+            pidl = shell32.ILCreateFromPathW(str(file_path))
+            if pidl:
+                try:
+                    if shell32.SHOpenFolderAndSelectItems(pidl, 0, None, 0) == 0:
+                        return True
+                finally:
+                    shell32.ILFree(pidl)
+        finally:
+            if hr_init in (0, 1):
+                ole32.CoUninitialize()
+    except OSError:
+        pass
+    return False
+
+
 def open_in_explorer(path_str):
     """在资源管理器中打开输出目录或选中输出目录内的指定文件。"""
     ensure_dirs()
@@ -111,7 +199,9 @@ def open_in_explorer(path_str):
     if not target.exists():
         target = OUTPUT_DIR.resolve()
     if target.is_file():
-        subprocess.Popen(['explorer.exe', '/select,', str(target)])
+        if not _select_file_via_shell(target):
+            no_win = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+            subprocess.Popen(f'explorer.exe /select,"{target}"', creationflags=no_win)
     else:
         os.startfile(str(target))
 
@@ -330,8 +420,78 @@ def _sanitize_zip_entry_name(name):
     return result + ('/' if is_dir else '')
 
 
+def _score_decoded_sample(sample_text, enc):
+    """基于东亚字符集常用字分区（GB2312 一级字 / Big5 第一字面 / 日文假名）评估解码可读性，避免 GB18030 超集盲目吞噬繁体或日文。"""
+    score = 0.0
+    for ch in sample_text:
+        code = ord(ch)
+        if code < 0x80:
+            continue
+        if 0xE000 <= code <= 0xF8FF or code == 0xFFFD or (code < 0x20 and ch not in '\r\n\t') or (0x7F <= code <= 0x9F):
+            score -= 8.0
+            continue
+        if enc == 'gb18030':
+            if 0x4E00 <= code <= 0x9FFF:
+                try:
+                    ch.encode('gb2312')
+                    score += 3.0
+                except UnicodeEncodeError:
+                    score -= 1.5
+            elif 0x3000 <= code <= 0x303F or 0xFF01 <= code <= 0xFF5E:
+                score += 1.5
+            else:
+                score -= 1.5
+        elif enc == 'big5':
+            try:
+                b = ch.encode('big5')
+            except UnicodeEncodeError:
+                score -= 4.0
+                continue
+            if len(b) == 2 and 0xA4 <= b[0] <= 0xC6:
+                score += 3.2
+            elif len(b) == 2 and 0xA1 <= b[0] <= 0xA3:
+                score += 1.5
+            else:
+                score -= 1.2
+        elif enc == 'shift_jis':
+            if 0x3040 <= code <= 0x309F:
+                score += 4.0
+            elif 0x30A0 <= code <= 0x30FF:
+                score += 2.8
+            elif 0x4E00 <= code <= 0x9FFF:
+                score += 2.0
+            elif 0x3000 <= code <= 0x303F or 0xFF01 <= code <= 0xFF5E:
+                score += 1.5
+            elif 0xFF61 <= code <= 0xFF9F:
+                score -= 2.5
+            else:
+                score -= 1.5
+    return score
+
+
+def _detect_legacy_encoding(raw_bytes):
+    """自动识别无 BOM 字节流的真实编码，返回 (encoding_name, decoded_text)；均不合法时返回 (None, None)。"""
+    try:
+        return 'utf-8', raw_bytes.decode('utf-8')
+    except UnicodeDecodeError:
+        pass
+    valid = []
+    for idx, enc in enumerate(('gb18030', 'big5', 'shift_jis')):
+        try:
+            decoded = raw_bytes.decode(enc)
+        except UnicodeDecodeError:
+            continue
+        sc = _score_decoded_sample(decoded[:4096], enc)
+        valid.append((sc, -idx, enc, decoded))
+    if not valid:
+        return None, None
+    valid.sort(reverse=True)
+    _, _, best_enc, best_txt = valid[0]
+    return best_enc, best_txt
+
+
 def fix_zip_encoding(path_str, source_encoding='auto', out_dir=None):
-    """修复 ZIP 压缩包内中文文件名乱码，并重新打包为标准 UTF-8 ZIP。"""
+    """修复 ZIP 压缩包内中文/日文文件名乱码，并重新打包为标准 UTF-8 ZIP。"""
     src = Path(path_str)
     if not src.exists():
         raise FileNotFoundError('ZIP 文件不存在')
@@ -339,7 +499,7 @@ def fix_zip_encoding(path_str, source_encoding='auto', out_dir=None):
         raise ValueError('该文件不是有效的 ZIP 压缩包')
 
     if source_encoding == 'auto':
-        candidates = ['utf-8', 'gb18030', 'big5', 'shift_jis']
+        candidates = None
     else:
         import codecs
         try:
@@ -361,7 +521,31 @@ def fix_zip_encoding(path_str, source_encoding='auto', out_dir=None):
 
     try:
         with zipfile.ZipFile(src, 'r') as zin, zipfile.ZipFile(out_path, 'w', compression=zipfile.ZIP_DEFLATED) as zout:
-            for info in zin.infolist():
+            infos = zin.infolist()
+            if candidates is None:
+                # 汇总包内非 UTF-8 标志的文件名字节样本做整体编码评分，提升短文件名繁体/日文识别率
+                sample_chunks = []
+                for inf in infos[:60]:
+                    if not (inf.flag_bits & 0x800):
+                        try:
+                            b = inf.filename.encode('cp437')
+                        except UnicodeEncodeError:
+                            continue
+                        try:
+                            b.decode('utf-8')
+                        except UnicodeDecodeError:
+                            sample_chunks.append(b)
+                if sample_chunks:
+                    det_enc, _ = _detect_legacy_encoding(b'\n'.join(sample_chunks))
+                else:
+                    det_enc = None
+                base_order = ['utf-8', 'gb18030', 'big5', 'shift_jis']
+                if det_enc and det_enc != 'utf-8':
+                    candidates = ['utf-8', det_enc] + [e for e in ('gb18030', 'big5', 'shift_jis') if e != det_enc]
+                else:
+                    candidates = base_order
+
+            for info in infos:
                 total_count += 1
                 if not info.is_dir() and info.file_size > max_entry_bytes:
                     raise ValueError(f'压缩包内单个文件过大（超过 256MB）：{info.filename}')
@@ -473,13 +657,7 @@ def fix_text_encoding(path_str, source_encoding='auto', target_encoding='utf-8',
         else:
             if b'\x00' in raw[:8192]:
                 raise ValueError('检测到二进制文件内容，请选择纯文本或 CSV 文件')
-            for enc in ('utf-8', 'gb18030', 'big5', 'shift_jis'):
-                try:
-                    text = raw.decode(enc)
-                    detected = enc
-                    break
-                except UnicodeDecodeError:
-                    continue
+            detected, text = _detect_legacy_encoding(raw)
             if text is None:
                 raise ValueError('无法自动识别该文件的文本编码，请手动选择原文件编码后重试')
     else:

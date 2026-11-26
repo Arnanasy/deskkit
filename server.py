@@ -4,10 +4,12 @@ import json
 import logging
 from logging.handlers import RotatingFileHandler
 import mimetypes
+import os
 from pathlib import Path
 import re
 import secrets
 import sys
+import tempfile
 import threading
 from urllib.parse import parse_qs, quote, unquote, urlparse
 import uuid
@@ -15,8 +17,8 @@ import uuid
 from tools_files import (
     OUTPUT_DIR, UPLOAD_DIR, UPLOAD_PREFIX, calc_file_hash, cleanup_old_uploads,
     ensure_dirs, execute_batch_rename, fix_text_encoding, fix_zip_encoding,
-    is_within, open_in_explorer, pick_files, pick_folder, preview_batch_rename,
-    safe_filename,
+    is_within, maybe_cleanup_uploads, open_in_explorer, pick_files, pick_folder,
+    preview_batch_rename, safe_filename, touch_upload_if_temp,
 )
 from tools_image import (
     process_convert_compress, rotate_flip_images, split_image, stitch_images,
@@ -44,31 +46,39 @@ CSP_HEADER = (
     "img-src 'self' data: blob:; media-src 'self' blob:; frame-src 'self'"
 )
 
+def _resolve_log_path():
+    """选择可写的错误日志路径（若安装目录如 Program Files 只读，自动回退到用户临时目录）。"""
+    primary = APP_DIR / 'DeskKit_error.log'
+    target_check = primary if primary.exists() else APP_DIR
+    if os.access(target_check, os.W_OK):
+        return primary
+    return Path(tempfile.gettempdir()) / 'DeskKit_error.log'
+
+
 log = logging.getLogger('toolbox')
 log.setLevel(logging.WARNING)
 if not log.handlers:
     try:
-        _log_path = APP_DIR / 'DeskKit_error.log'
         _handler = RotatingFileHandler(
-            _log_path, maxBytes=512000, backupCount=1, delay=True, encoding='utf-8'
+            _resolve_log_path(), maxBytes=512000, backupCount=1, delay=True, encoding='utf-8'
         )
+        _handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
+        log.addHandler(_handler)
     except OSError:
-        _handler = RotatingFileHandler(
-            UPLOAD_DIR.parent / 'DeskKit_error.log', maxBytes=512000, backupCount=1, delay=True, encoding='utf-8'
-        )
-    _handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
-    log.addHandler(_handler)
+        log.addHandler(logging.NullHandler())
 
 
 class PathForbiddenError(PermissionError):
     """请求访问未经上传、输出或系统弹窗授权的本地路径时抛出。"""
 
 
-_WIN_PATH_RE = re.compile(r'[A-Za-z]:\\[^\s\'"]+')
+_WIN_PATH_RE = re.compile(
+    r'[A-Za-z]:[\\/](?:[^\r\n\t\'"<>|?*:()（）\u3000；，]*[^\s\r\n\t\'"<>|?*:()（）\u3000；，。！？])?'
+)
 
 
 def _sanitize_error_msg(err):
-    """剥离业务提示中可能夹带的本机盘符绝对路径，防止向前端暴露目录结构。"""
+    """剥离业务提示中可能夹带的本机盘符绝对路径（兼容正反斜杠与含空格文件夹名），防止暴露目录结构。"""
     msg = _WIN_PATH_RE.sub('<本地路径>', str(err or '').strip())
     return msg[:240] or '请求参数有误'
 
@@ -121,6 +131,9 @@ class ToolboxHandler(BaseHTTPRequestHandler):
         return True
 
     def _send_json(self, payload, status=200):
+        # HTTP/1.1 下任何错误响应均主动关闭连接，防止未读取完毕的请求体字节污染同一连接的下一次请求
+        if status >= 400:
+            self.close_connection = True
         body = json.dumps(payload, ensure_ascii=False).encode('utf-8')
         self.send_response(status)
         self.send_header('Content-Type', 'application/json; charset=utf-8')
@@ -179,6 +192,7 @@ class ToolboxHandler(BaseHTTPRequestHandler):
         target = Path(path_str).resolve()
         if not self._can_preview(target):
             raise PathForbiddenError('无权访问未经选择或上传的本地文件路径')
+        touch_upload_if_temp(target)
         return str(target)
 
     def _require_files(self, paths):
@@ -390,9 +404,10 @@ class ToolboxHandler(BaseHTTPRequestHandler):
         path = parsed.path
         qs = parse_qs(parsed.query)
         try:
-            # 流式二进制上传（兼容大文件，限制上限并清理中断残留）
+            # 流式二进制上传（兼容大文件，限制上限并清理中断与过期残留）
             if path == '/api/upload':
                 ensure_dirs()
+                maybe_cleanup_uploads(protected_paths=video_tasks.active_input_paths())
                 raw_name = unquote(qs.get('name', ['file'])[0])
                 safe = safe_filename(Path(raw_name).name)
                 token = uuid.uuid4().hex[:8]
@@ -410,6 +425,7 @@ class ToolboxHandler(BaseHTTPRequestHandler):
                             f.write(chunk)
                             remaining -= len(chunk)
                 except Exception:
+                    self.close_connection = True
                     target.unlink(missing_ok=True)
                     raise
                 self._send_json({
@@ -449,8 +465,27 @@ class ToolboxHandler(BaseHTTPRequestHandler):
                 self._send_json({'ok': True})
                 return
 
+            if path == '/api/cleanup-uploads':
+                # 前端移除文件或清空列表时，即时回收不再被后台队列引用的上传临时副本
+                active_norm = {
+                    os.path.normcase(str(Path(p).resolve()))
+                    for p in video_tasks.active_input_paths()
+                }
+                removed = 0
+                for raw_p in (data.get('paths') or []):
+                    if not isinstance(raw_p, str) or not raw_p.strip():
+                        continue
+                    cand = Path(raw_p).resolve()
+                    if is_within(cand, UPLOAD_DIR) and cand.is_file():
+                        if os.path.normcase(str(cand)) not in active_norm:
+                            cand.unlink(missing_ok=True)
+                            removed += 1
+                self._send_json({'ok': True, 'removed': removed})
+                return
+
             if path == '/api/shutdown':
                 video_tasks.cancel_all()
+                cleanup_old_uploads(max_age_seconds=0)
                 self.close_connection = True
                 self._send_json({'ok': True})
                 on_shutdown = getattr(self.server, 'on_shutdown', None)

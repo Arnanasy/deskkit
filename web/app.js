@@ -12,11 +12,9 @@ const PAGE_META = {
 const state = {
   outputDir: '',
   videoPath: '',
-  videoTaskId: '',
-  videoPoll: null,
+  videoTasks: [],
+  videoQueuePoll: null,
   videoMergeFiles: [],
-  videoMergeTaskId: '',
-  videoMergePoll: null,
   videoSubPath: '',
   imageFiles: [],
   pdfMergeFiles: [],
@@ -135,6 +133,27 @@ function openPath(p) {
   api('/api/open-path', { path: p || state.outputDir }).catch((e) => toast(e.message));
 }
 
+function releaseTempUploads(paths) {
+  const valid = (paths || []).filter(Boolean);
+  if (valid.length) {
+    api('/api/cleanup-uploads', { paths: valid }).catch(() => {});
+  }
+}
+
+function bindAsyncBtn(selector, handler) {
+  const btn = typeof selector === 'string' ? $(selector) : selector;
+  if (!btn) return;
+  btn.onclick = async (ev) => {
+    if (btn.disabled) return;
+    btn.disabled = true;
+    try {
+      await handler(ev);
+    } finally {
+      btn.disabled = false;
+    }
+  };
+}
+
 function downloadUrl(p) {
   return `/api/download?path=${encodeURIComponent(p)}&token=${encodeURIComponent(API_TOKEN)}`;
 }
@@ -229,6 +248,8 @@ $$('.subtabs').forEach((group) => {
       parent.querySelectorAll(':scope > .subpanel').forEach((sp) => {
         sp.classList.toggle('active', sp.id === tab.dataset.sub);
       });
+      if (group.dataset.group === 'pdf') $('#pdf-result').innerHTML = '';
+      if (group.dataset.group === 'image') $('#img-result').innerHTML = '';
     };
   });
 });
@@ -267,12 +288,15 @@ function setupDropzone(el, onFiles) {
 
 // ==================== 1. 视频工坊 ====================
 async function loadVideo(path) {
+  const prevPath = state.videoPath;
   try {
     toast('正在解析视频编码…');
     const info = await api('/api/video/probe', { path });
+    if (prevPath && prevPath !== info.path) releaseTempUploads([prevPath]);
     state.videoPath = info.path;
     $('#video-probe-box').style.display = 'block';
     $('#video-action-card').style.display = 'block';
+    $('#v-frames-result').innerHTML = '';
     $('#v-name').textContent = info.name;
     $('#v-vcodec').textContent = info.video_codec.toUpperCase();
     $('#v-pixfmt').textContent = info.pix_fmt;
@@ -304,6 +328,7 @@ async function loadVideo(path) {
     $('#v-src-preview').innerHTML = '';
     $('#btn-video-preview').textContent = '▶ 预览原视频';
   } catch (e) {
+    if (path && path !== prevPath) releaseTempUploads([path]);
     toast(e.message);
   }
 }
@@ -321,19 +346,14 @@ $('#btn-video-preview').onclick = () => {
 };
 
 function clearVideo() {
-  clearInterval(state.videoPoll);
-  if (state.videoTaskId) {
-    api('/api/video/cancel', { id: state.videoTaskId }).catch(() => {});
-    state.videoTaskId = '';
-  }
+  const prevPath = state.videoPath;
   state.videoPath = '';
   $('#video-probe-box').style.display = 'none';
   $('#video-action-card').style.display = 'none';
-  $('#video-progress-box').style.display = 'none';
-  $('#vp-actions').innerHTML = '';
-  $('#vp-preview').innerHTML = '';
+  $('#v-frames-result').innerHTML = '';
   $('#v-src-preview').innerHTML = '';
-  toast('已移除当前视频');
+  releaseTempUploads([prevPath]);
+  toast('已移除当前视频（后台运行中的任务不受影响）');
 }
 
 $('#btn-video-clear').onclick = clearVideo;
@@ -368,115 +388,151 @@ setupDropzone($('#video-drop'), async (files) => {
   } catch (err) { toast(err.message); }
 });
 
-function pollVideoTask(task, ui, pollKey, taskKey = 'videoTaskId') {
-  clearInterval(state[pollKey]);
-  state[taskKey] = task.id;
-  ui.box.style.display = 'block';
-  ui.desc.textContent = task.mode_desc;
-  ui.bar.style.width = task.status === 'queued' ? '0%' : '2%';
-  ui.stat.className = 'badge badge-info';
-  ui.stat.textContent = task.status === 'queued'
-    ? `排队等待中（第 ${task.queue_pos || 1} 位）…`
-    : '启动中…';
-  ui.actions.innerHTML = `<button class="btn btn-sm btn-danger js-v-cancel">取消任务</button>`;
-  ui.preview.innerHTML = '';
-  ui.actions.querySelector('.js-v-cancel').onclick = () => api('/api/video/cancel', { id: task.id });
+function updateVideoTaskCard(entry, cur) {
+  const { el } = entry;
+  const bar = el.querySelector('.js-t-bar');
+  const stat = el.querySelector('.js-t-stat');
+  const actions = el.querySelector('.js-t-actions');
+  const preview = el.querySelector('.js-t-preview');
 
-  state[pollKey] = setInterval(async () => {
-    try {
-      const cur = await api(`/api/video/task/${task.id}`);
-      if (cur.status === 'queued') {
-        ui.bar.style.width = '0%';
-        ui.stat.textContent = `排队等待中（第 ${cur.queue_pos || 1} 位）…`;
-      } else if (cur.status === 'running') {
-        ui.bar.style.width = `${Math.max(2, cur.progress)}%`;
-        ui.stat.textContent = `${cur.progress}%${cur.speed ? ' · ' + cur.speed : ''}`;
-      } else {
-        clearInterval(state[pollKey]);
-        if (cur.status === 'done') {
-          ui.bar.style.width = '100%';
-          ui.stat.className = 'badge badge-ok';
-          ui.stat.textContent = `完成 · 耗时 ${cur.elapsed}s`;
-          const ratio = cur.input_size ? `${fmtBytes(cur.input_size)} → ${fmtBytes(cur.output_size)}` : fmtBytes(cur.output_size);
-          ui.actions.innerHTML = `
-            <span style="font-size:12px;color:var(--muted);">${escHtml(cur.output_name)} (${escHtml(ratio)})</span>
-            <button class="btn btn-sm js-toggle-vprev">👁️ 收起预览</button>
-            <button class="btn btn-sm js-open-path">📂 打开所在文件夹</button>
-            <a class="btn btn-sm btn-primary" href="${downloadUrl(cur.output_path)}">⬇️ 下载</a>`;
-          ui.actions.querySelector('.js-open-path').onclick = () => openPath(cur.output_path);
-          ui.preview.innerHTML = buildPreviewHtml(cur.output_path);
-          let pvShown = true;
-          const pvBtn = ui.actions.querySelector('.js-toggle-vprev');
-          pvBtn.onclick = () => {
-            pvShown = !pvShown;
-            ui.preview.innerHTML = pvShown ? buildPreviewHtml(cur.output_path) : '';
-            pvBtn.textContent = pvShown ? '👁️ 收起预览' : '👁️ 预览结果';
-          };
-          toast('视频处理完成！');
-        } else if (cur.status === 'cancelled') {
-          ui.stat.className = 'badge badge-warn';
-          ui.stat.textContent = '已取消';
-          ui.actions.innerHTML = '';
-        } else {
-          ui.stat.className = 'badge badge-warn';
-          ui.stat.textContent = '失败';
-          ui.actions.innerHTML = `<div class="alert alert-err" style="width:100%;">${escHtml(cur.error)}</div>`;
-        }
+  if (cur.status === 'queued') {
+    bar.style.width = '0%';
+    stat.className = 'badge badge-info';
+    stat.textContent = `排队等待中（第 ${cur.queue_pos || 1} 位）…`;
+  } else if (cur.status === 'running') {
+    bar.style.width = `${Math.max(2, cur.progress)}%`;
+    stat.className = 'badge badge-info';
+    stat.textContent = `${cur.progress}%${cur.speed ? ' · ' + cur.speed : ''}`;
+  } else {
+    entry.active = false;
+    if (cur.status === 'done') {
+      bar.style.width = '100%';
+      stat.className = 'badge badge-ok';
+      stat.textContent = `完成 · 耗时 ${cur.elapsed}s`;
+      const ratio = cur.input_size ? `${fmtBytes(cur.input_size)} → ${fmtBytes(cur.output_size)}` : fmtBytes(cur.output_size);
+      actions.innerHTML = `
+        <span style="font-size:12px;color:var(--muted);">${escHtml(cur.output_name)} (${escHtml(ratio)})</span>
+        <button class="btn btn-sm js-toggle-vprev">👁️ 收起预览</button>
+        <button class="btn btn-sm js-open-path">📂 打开所在文件夹</button>
+        <a class="btn btn-sm btn-primary" href="${downloadUrl(cur.output_path)}">⬇️ 下载</a>`;
+      actions.querySelector('.js-open-path').onclick = () => openPath(cur.output_path);
+      preview.innerHTML = buildPreviewHtml(cur.output_path);
+      let pvShown = true;
+      const pvBtn = actions.querySelector('.js-toggle-vprev');
+      pvBtn.onclick = () => {
+        pvShown = !pvShown;
+        preview.innerHTML = pvShown ? buildPreviewHtml(cur.output_path) : '';
+        pvBtn.textContent = pvShown ? '👁️ 收起预览' : '👁️ 预览结果';
+      };
+      toast(`视频处理完成：${cur.output_name}`);
+    } else if (cur.status === 'cancelled') {
+      stat.className = 'badge badge-warn';
+      stat.textContent = '已取消';
+      actions.innerHTML = '';
+    } else {
+      stat.className = 'badge badge-warn';
+      stat.textContent = '失败';
+      actions.innerHTML = `<div class="alert alert-err" style="width:100%;">${escHtml(cur.error)}</div>`;
+    }
+  }
+}
+
+function ensureVideoQueuePoller() {
+  if (state.videoQueuePoll) return;
+  state.videoQueuePoll = setInterval(async () => {
+    const activeEntries = state.videoTasks.filter((t) => t.active);
+    if (!activeEntries.length) {
+      clearInterval(state.videoQueuePoll);
+      state.videoQueuePoll = null;
+      return;
+    }
+    for (const entry of activeEntries) {
+      try {
+        const cur = await api(`/api/video/task/${entry.id}`);
+        updateVideoTaskCard(entry, cur);
+      } catch (err) {
+        entry.active = false;
+        toast(err.message);
       }
-    } catch (err) {
-      clearInterval(state[pollKey]);
-      toast(err.message);
     }
   }, 450);
 }
+
+function addVideoTask(task) {
+  const card = $('#video-tasks-card');
+  const list = $('#video-task-list');
+  card.style.display = 'block';
+
+  const el = document.createElement('div');
+  el.className = 'task-card';
+  const titlePrefix = task.source_name ? `${task.source_name} · ` : '';
+  el.innerHTML = `
+    <div class="row" style="justify-content:space-between;">
+      <strong style="font-size:13px;word-break:break-all;">${escHtml(titlePrefix + task.mode_desc)}</strong>
+      <span class="badge badge-info js-t-stat">${task.status === 'queued' ? `排队等待中（第 ${task.queue_pos || 1} 位）…` : '启动中…'}</span>
+    </div>
+    <div class="progress-wrap"><div class="progress-bar js-t-bar" style="width:${task.status === 'queued' ? '0%' : '2%'};"></div></div>
+    <div class="row js-t-actions"><button class="btn btn-sm btn-danger js-v-cancel">取消任务</button></div>
+    <div class="js-t-preview"></div>`;
+
+  el.querySelector('.js-v-cancel').onclick = () => api('/api/video/cancel', { id: task.id }).catch((e) => toast(e.message));
+  list.prepend(el);
+
+  state.videoTasks.unshift({ id: task.id, el, active: true });
+  ensureVideoQueuePoller();
+}
+
+$('#btn-vtasks-clear-done').onclick = () => {
+  const kept = [];
+  for (const t of state.videoTasks) {
+    if (t.active) kept.push(t);
+    else t.el.remove();
+  }
+  state.videoTasks = kept;
+  if (!state.videoTasks.length) $('#video-tasks-card').style.display = 'none';
+};
 
 async function startVideoJob(mode, options) {
   if (!state.videoPath) return toast('请先选择视频文件');
   try {
     const task = await api('/api/video/start', { path: state.videoPath, mode, options });
-    pollVideoTask(task, {
-      box: $('#video-progress-box'),
-      desc: $('#vp-desc'),
-      bar: $('#vp-bar'),
-      stat: $('#vp-stat'),
-      actions: $('#vp-actions'),
-      preview: $('#vp-preview'),
-    }, 'videoPoll');
+    addVideoTask(task);
   } catch (e) {
     toast(e.message);
   }
 }
 
-$('#btn-run-compat').onclick = () => startVideoJob('compat', {
+bindAsyncBtn('#btn-run-compat', () => startVideoJob('compat', {
   quality: $('#vc-quality').value,
   use_nvenc: $('#vc-nvenc').checked,
   force_reencode: $('#vc-force').checked,
-});
-$('#btn-run-compress').onclick = () => startVideoJob('compress', {
+}));
+bindAsyncBtn('#btn-run-compress', () => startVideoJob('compress', {
   quality: $('#vcomp-quality').value,
   max_height: Number($('#vcomp-height').value),
   use_nvenc: $('#vcomp-nvenc').checked,
-});
-$('#btn-run-trim').onclick = () => startVideoJob('trim', {
+}));
+bindAsyncBtn('#btn-run-trim', () => startVideoJob('trim', {
   start: $('#vtrim-start').value,
   end: $('#vtrim-end').value,
   lossless: $('#vtrim-lossless').checked,
   use_nvenc: $('#vtrim-nvenc').checked,
-});
-$('#btn-run-rotate').onclick = () => startVideoJob('rotate', {
+}));
+bindAsyncBtn('#btn-run-rotate', () => startVideoJob('rotate', {
   rotate_op: $('#vrot-op').value,
   quality: $('#vrot-quality').value,
   use_nvenc: $('#vrot-nvenc').checked,
-});
-$('#btn-run-audio').onclick = () => startVideoJob('audio', { audio_format: $('#vaudio-fmt').value });
-$('#btn-run-gif').onclick = () => startVideoJob('gif', {
+}));
+bindAsyncBtn('#btn-run-audio', () => startVideoJob('audio', { audio_format: $('#vaudio-fmt').value }));
+bindAsyncBtn('#btn-run-gif', () => startVideoJob('gif', {
   start: $('#vgif-start').value,
   end: $('#vgif-end').value,
   width: Number($('#vgif-width').value),
   fps: Number($('#vgif-fps').value),
-});
-$('#btn-run-frames').onclick = async () => {
+}));
+bindAsyncBtn('#btn-run-frames', async () => {
   if (!state.videoPath) return toast('请先选择视频文件');
+  $('#v-frames-result').innerHTML = '';
   try {
     toast('正在批量截取视频画面…');
     const res = await api('/api/video/frames', {
@@ -497,7 +553,7 @@ $('#btn-run-frames').onclick = async () => {
       res.preview_path,
     );
   } catch (e) { toast(e.message); }
-};
+});
 
 // 多视频合并
 const refreshVideoMerge = () => renderFileList($('#vmerge-list'), state.videoMergeFiles, refreshVideoMerge, false, true);
@@ -515,6 +571,7 @@ $('#btn-vmerge-pick').onclick = async (e) => {
 };
 $('#btn-vmerge-clear').onclick = (e) => {
   e.stopPropagation();
+  releaseTempUploads(state.videoMergeFiles.map((f) => f.path));
   state.videoMergeFiles = [];
   refreshVideoMerge();
 };
@@ -525,7 +582,7 @@ setupDropzone($('#vmerge-drop'), async (files) => {
     refreshVideoMerge();
   } catch (err) { toast(err.message); }
 });
-$('#btn-run-vmerge').onclick = async () => {
+bindAsyncBtn('#btn-run-vmerge', async () => {
   if (state.videoMergeFiles.length < 2) return toast('请至少选择 2 个视频文件');
   try {
     const task = await api('/api/video/merge', {
@@ -535,22 +592,17 @@ $('#btn-run-vmerge').onclick = async () => {
         use_nvenc: $('#vmerge-nvenc').checked,
       },
     });
-    pollVideoTask(task, {
-      box: $('#vmerge-progress-box'),
-      desc: $('#vmp-desc'),
-      bar: $('#vmp-bar'),
-      stat: $('#vmp-stat'),
-      actions: $('#vmp-actions'),
-      preview: $('#vmp-preview'),
-    }, 'videoMergePoll', 'videoMergeTaskId');
+    addVideoTask(task);
   } catch (e) { toast(e.message); }
-};
+});
 
 // 字幕格式互转
 function setVideoSub(path, name, size) {
+  if (state.videoSubPath && state.videoSubPath !== path) releaseTempUploads([state.videoSubPath]);
   state.videoSubPath = path;
   $('#vsub-meta').textContent = size ? `${name}（${fmtBytes(size)}）` : name;
   $('#btn-vsub-clear').style.display = 'inline-flex';
+  $('#vsub-result').innerHTML = '';
 }
 $('#btn-vsub-pick').onclick = async (e) => {
   e.stopPropagation();
@@ -565,6 +617,7 @@ $('#btn-vsub-pick').onclick = async (e) => {
 };
 $('#btn-vsub-clear').onclick = (e) => {
   e.stopPropagation();
+  releaseTempUploads([state.videoSubPath]);
   state.videoSubPath = '';
   $('#vsub-meta').textContent = '';
   $('#btn-vsub-clear').style.display = 'none';
@@ -576,8 +629,9 @@ setupDropzone($('#vsub-drop'), async (files) => {
     setVideoSub(up.path, up.name, up.size);
   } catch (err) { toast(err.message); }
 });
-$('#btn-vsub-run').onclick = async () => {
+bindAsyncBtn('#btn-vsub-run', async () => {
   if (!state.videoSubPath) return toast('请先选择字幕文件');
+  $('#vsub-result').innerHTML = '';
   try {
     const res = await api('/api/video/subtitle', {
       path: state.videoSubPath,
@@ -591,7 +645,7 @@ $('#btn-vsub-run').onclick = async () => {
       `共 ${res.cues} 条字幕 · 源编码 ${res.detected_encoding} → UTF-8 · ${fmtBytes(res.output_size)}`,
     );
   } catch (e) { toast(e.message); }
-};
+});
 
 // ==================== 2. 图片工坊 ====================
 function renderFileList(el, arr, onChange, showThumb = false, sortable = true) {
@@ -614,7 +668,11 @@ function renderFileList(el, arr, onChange, showThumb = false, sortable = true) {
   });
 
   el.querySelectorAll('.js-del').forEach((b) => {
-    b.onclick = () => { arr.splice(Number(b.dataset.idx), 1); onChange(); };
+    b.onclick = () => {
+      const removed = arr.splice(Number(b.dataset.idx), 1);
+      releaseTempUploads(removed.map((x) => x.path));
+      onChange();
+    };
   });
   if (sortable) {
     el.querySelectorAll('.js-up').forEach((b) => {
@@ -677,6 +735,7 @@ $('#btn-img-pick').onclick = async (e) => {
 $('#btn-img-upload').onclick = (e) => { e.stopPropagation(); $('#img-file-input').click(); };
 $('#btn-img-clear').onclick = (e) => {
   e.stopPropagation();
+  releaseTempUploads(state.imageFiles.map((f) => f.path));
   state.imageFiles = [];
   refreshImgList();
   $('#img-result').innerHTML = '';
@@ -701,8 +760,9 @@ setupDropzone($('#img-drop'), async (files) => {
   } catch (err) { toast(err.message); }
 });
 
-$('#btn-img-run').onclick = async () => {
+bindAsyncBtn('#btn-img-run', async () => {
   if (!state.imageFiles.length) return toast('请先添加图片');
+  $('#img-result').innerHTML = '';
   try {
     toast('正在处理图片…');
     const res = await api('/api/image/process', {
@@ -721,10 +781,11 @@ $('#btn-img-run').onclick = async () => {
       : `共处理 ${res.files.length} 张，已同时打包 ZIP`;
     renderResultCard($('#img-result'), '图片处理完成', dlPath, dlName, summary, first.path);
   } catch (e) { toast(e.message); }
-};
+});
 
-$('#btn-stitch-run').onclick = async () => {
+bindAsyncBtn('#btn-stitch-run', async () => {
   if (state.imageFiles.length < 2) return toast('拼接至少需要 2 张图片');
+  $('#img-result').innerHTML = '';
   try {
     toast('正在拼接图片…');
     const res = await api('/api/image/stitch', {
@@ -737,10 +798,11 @@ $('#btn-stitch-run').onclick = async () => {
     });
     renderResultCard($('#img-result'), '拼接完成', res.path, res.name, `${res.width}×${res.height} · ${fmtBytes(res.output_size)}`);
   } catch (e) { toast(e.message); }
-};
+});
 
-$('#btn-img-rot-run').onclick = async () => {
+bindAsyncBtn('#btn-img-rot-run', async () => {
   if (!state.imageFiles.length) return toast('请先添加图片');
+  $('#img-result').innerHTML = '';
   try {
     toast('正在批量旋转/翻转图片…');
     const res = await api('/api/image/rotate', {
@@ -756,10 +818,11 @@ $('#btn-img-rot-run').onclick = async () => {
       : `共处理 ${res.files.length} 张，已打包 ZIP`;
     renderResultCard($('#img-result'), '旋转/翻转完成', dlPath, dlName, summary, first.path);
   } catch (e) { toast(e.message); }
-};
+});
 
-$('#btn-split-run').onclick = async () => {
+bindAsyncBtn('#btn-split-run', async () => {
   if (!state.imageFiles.length) return toast('请先在上方添加至少 1 张图片');
+  $('#img-result').innerHTML = '';
   try {
     toast('正在分割图片…');
     const res = await api('/api/image/split', {
@@ -780,7 +843,7 @@ $('#btn-split-run').onclick = async () => {
       res.first_path,
     );
   } catch (e) { toast(e.message); }
-};
+});
 
 // ==================== 3. PDF 工坊 ====================
 const refreshPdfMerge = () => renderFileList($('#pdf-merge-list'), state.pdfMergeFiles, refreshPdfMerge, false, true);
@@ -794,61 +857,78 @@ $('#btn-pdf-merge-pick').onclick = async (e) => {
     refreshPdfMerge();
   } catch (err) { toast(err.message); }
 };
-$('#btn-pdf-merge-clear').onclick = (e) => { e.stopPropagation(); state.pdfMergeFiles = []; refreshPdfMerge(); };
+$('#btn-pdf-merge-clear').onclick = (e) => {
+  e.stopPropagation();
+  releaseTempUploads(state.pdfMergeFiles.map((f) => f.path));
+  state.pdfMergeFiles = [];
+  refreshPdfMerge();
+  $('#pdf-result').innerHTML = '';
+};
 setupDropzone($('#pdf-merge-drop'), async (files) => {
   try {
     for (const f of files) state.pdfMergeFiles.push(await uploadFile(f));
     refreshPdfMerge();
   } catch (err) { toast(err.message); }
 });
-$('#btn-pdf-merge-run').onclick = async () => {
+bindAsyncBtn('#btn-pdf-merge-run', async () => {
   if (state.pdfMergeFiles.length < 2) return toast('请至少选择 2 个 PDF');
+  $('#pdf-result').innerHTML = '';
   try {
     const res = await api('/api/pdf/merge', { paths: state.pdfMergeFiles.map((f) => f.path) });
     renderResultCard($('#pdf-result'), 'PDF 合并完成', res.path, res.name, `共 ${res.pages} 页 · ${fmtBytes(res.output_size)}`);
   } catch (e) { toast(e.message); }
-};
+});
 
-async function loadSinglePdf(path, metaEl, clearBtn, setter) {
+async function loadSinglePdf(path, metaEl, clearBtn, setter, getter) {
+  const prev = getter ? getter() : '';
   const info = await api('/api/pdf/info', { path });
+  if (prev && prev !== info.path) releaseTempUploads([prev]);
   setter(info.path);
   const lockTip = info.needs_pass
     ? '🔒 已设打开密码'
     : (info.is_encrypted ? '🔐 含权限限制' : `${info.pages} 页`);
   metaEl.textContent = `${info.name}（${lockTip} · ${fmtBytes(info.size_bytes)}）`;
   clearBtn.style.display = 'inline-flex';
+  $('#pdf-result').innerHTML = '';
 }
-async function pickSinglePdf(metaEl, clearBtn, setter) {
+async function pickSinglePdf(metaEl, clearBtn, setter, getter) {
   try {
     const res = await api('/api/pick-files', { title: '选择 PDF 文件', filetypes: [['PDF 文件', '*.pdf']], multiple: false });
     if (!res.files.length) return;
-    await loadSinglePdf(res.files[0], metaEl, clearBtn, setter);
+    await loadSinglePdf(res.files[0], metaEl, clearBtn, setter, getter);
   } catch (err) { toast(err.message); }
 }
-function bindDropSinglePdf(dropEl, metaEl, clearBtn, setter) {
+function bindDropSinglePdf(dropEl, metaEl, clearBtn, setter, getter) {
   setupDropzone(dropEl, async (files) => {
+    let up = null;
     try {
-      const up = await uploadFile(files[0]);
-      await loadSinglePdf(up.path, metaEl, clearBtn, setter);
-    } catch (err) { toast(err.message); }
+      up = await uploadFile(files[0]);
+      await loadSinglePdf(up.path, metaEl, clearBtn, setter, getter);
+    } catch (err) {
+      if (up && up.path) releaseTempUploads([up.path]);
+      toast(err.message);
+    }
   });
 }
-function bindClearPdf(clearBtn, metaEl, setter) {
+function bindClearPdf(clearBtn, metaEl, setter, getter) {
   clearBtn.onclick = (e) => {
     if (e) e.stopPropagation();
+    const prev = getter ? getter() : '';
     setter('');
+    releaseTempUploads([prev]);
     metaEl.textContent = '';
     clearBtn.style.display = 'none';
     $('#pdf-result').innerHTML = '';
-    toast('已移除所选 PDF');
+    toast('已移除所选文件');
   };
 }
 
-$('#btn-pdf-edit-pick').onclick = (e) => { e.stopPropagation(); pickSinglePdf($('#pdf-edit-meta'), $('#btn-pdf-edit-clear'), (p) => state.pdfEditPath = p); };
-bindClearPdf($('#btn-pdf-edit-clear'), $('#pdf-edit-meta'), (p) => state.pdfEditPath = p);
-bindDropSinglePdf($('#pdf-edit-drop'), $('#pdf-edit-meta'), $('#btn-pdf-edit-clear'), (p) => state.pdfEditPath = p);
-$('#btn-pdf-edit-run').onclick = async () => {
+$('#btn-pdf-edit-pick').onclick = (e) => { e.stopPropagation(); pickSinglePdf($('#pdf-edit-meta'), $('#btn-pdf-edit-clear'), (p) => state.pdfEditPath = p, () => state.pdfEditPath); };
+bindClearPdf($('#btn-pdf-edit-clear'), $('#pdf-edit-meta'), (p) => state.pdfEditPath = p, () => state.pdfEditPath);
+bindDropSinglePdf($('#pdf-edit-drop'), $('#pdf-edit-meta'), $('#btn-pdf-edit-clear'), (p) => state.pdfEditPath = p, () => state.pdfEditPath);
+bindAsyncBtn('#btn-pdf-edit-run', async () => {
   if (!state.pdfEditPath) return toast('请先选择 PDF');
+  $('#pdf-result').innerHTML = '';
   try {
     const res = await api('/api/pdf/edit', {
       path: state.pdfEditPath,
@@ -858,13 +938,14 @@ $('#btn-pdf-edit-run').onclick = async () => {
     });
     renderResultCard($('#pdf-result'), 'PDF 处理完成', res.path, res.name, `${res.pages} 页 · ${fmtBytes(res.output_size)}`);
   } catch (e) { toast(e.message); }
-};
+});
 
-$('#btn-pdf-img-pick').onclick = (e) => { e.stopPropagation(); pickSinglePdf($('#pdf-img-meta'), $('#btn-pdf-img-clear'), (p) => state.pdfImgPath = p); };
-bindClearPdf($('#btn-pdf-img-clear'), $('#pdf-img-meta'), (p) => state.pdfImgPath = p);
-bindDropSinglePdf($('#pdf-img-drop'), $('#pdf-img-meta'), $('#btn-pdf-img-clear'), (p) => state.pdfImgPath = p);
-$('#btn-pdf-img-run').onclick = async () => {
+$('#btn-pdf-img-pick').onclick = (e) => { e.stopPropagation(); pickSinglePdf($('#pdf-img-meta'), $('#btn-pdf-img-clear'), (p) => state.pdfImgPath = p, () => state.pdfImgPath); };
+bindClearPdf($('#btn-pdf-img-clear'), $('#pdf-img-meta'), (p) => state.pdfImgPath = p, () => state.pdfImgPath);
+bindDropSinglePdf($('#pdf-img-drop'), $('#pdf-img-meta'), $('#btn-pdf-img-clear'), (p) => state.pdfImgPath = p, () => state.pdfImgPath);
+bindAsyncBtn('#btn-pdf-img-run', async () => {
   if (!state.pdfImgPath) return toast('请先选择 PDF');
+  $('#pdf-result').innerHTML = '';
   try {
     toast('正在渲染页面为图片…');
     const res = await api('/api/pdf/to-images', {
@@ -875,7 +956,7 @@ $('#btn-pdf-img-run').onclick = async () => {
     });
     renderResultCard($('#pdf-result'), '导出图片完成', res.path, res.name, `共 ${res.count} 张 · ${fmtBytes(res.output_size)}`);
   } catch (e) { toast(e.message); }
-};
+});
 
 $('#btn-pfi-pick').onclick = async (e) => {
   e.stopPropagation();
@@ -885,40 +966,49 @@ $('#btn-pfi-pick').onclick = async (e) => {
     refreshPfi();
   } catch (err) { toast(err.message); }
 };
-$('#btn-pfi-clear').onclick = (e) => { e.stopPropagation(); state.pdfFromImgFiles = []; refreshPfi(); };
+$('#btn-pfi-clear').onclick = (e) => {
+  e.stopPropagation();
+  releaseTempUploads(state.pdfFromImgFiles.map((f) => f.path));
+  state.pdfFromImgFiles = [];
+  refreshPfi();
+  $('#pdf-result').innerHTML = '';
+};
 setupDropzone($('#pfi-drop'), async (files) => {
   try {
     for (const f of files) state.pdfFromImgFiles.push(await uploadFile(f));
     refreshPfi();
   } catch (err) { toast(err.message); }
 });
-$('#btn-pfi-run').onclick = async () => {
+bindAsyncBtn('#btn-pfi-run', async () => {
   if (!state.pdfFromImgFiles.length) return toast('请至少选择 1 张图片');
+  $('#pdf-result').innerHTML = '';
   try {
     const res = await api('/api/pdf/from-images', { paths: state.pdfFromImgFiles.map((f) => f.path) });
     renderResultCard($('#pdf-result'), '图片合成 PDF 完成', res.path, res.name, `${res.pages} 页 · ${fmtBytes(res.output_size)}`);
   } catch (e) { toast(e.message); }
-};
+});
 
-$('#btn-pdf-comp-pick').onclick = (e) => { e.stopPropagation(); pickSinglePdf($('#pdf-comp-meta'), $('#btn-pdf-comp-clear'), (p) => state.pdfCompPath = p); };
-bindClearPdf($('#btn-pdf-comp-clear'), $('#pdf-comp-meta'), (p) => state.pdfCompPath = p);
-bindDropSinglePdf($('#pdf-comp-drop'), $('#pdf-comp-meta'), $('#btn-pdf-comp-clear'), (p) => state.pdfCompPath = p);
-$('#btn-pdf-comp-run').onclick = async () => {
+$('#btn-pdf-comp-pick').onclick = (e) => { e.stopPropagation(); pickSinglePdf($('#pdf-comp-meta'), $('#btn-pdf-comp-clear'), (p) => state.pdfCompPath = p, () => state.pdfCompPath); };
+bindClearPdf($('#btn-pdf-comp-clear'), $('#pdf-comp-meta'), (p) => state.pdfCompPath = p, () => state.pdfCompPath);
+bindDropSinglePdf($('#pdf-comp-drop'), $('#pdf-comp-meta'), $('#btn-pdf-comp-clear'), (p) => state.pdfCompPath = p, () => state.pdfCompPath);
+bindAsyncBtn('#btn-pdf-comp-run', async () => {
   if (!state.pdfCompPath) return toast('请先选择 PDF');
+  $('#pdf-result').innerHTML = '';
   try {
     toast('正在压缩 PDF…');
     const res = await api('/api/pdf/compress', { path: state.pdfCompPath, level: $('#pdf-comp-level').value });
     renderResultCard($('#pdf-result'), 'PDF 压缩完成', res.path, res.name,
       `${fmtBytes(res.input_size)} → ${fmtBytes(res.output_size)}（节省 ${res.saved_pct}%）`);
   } catch (e) { toast(e.message); }
-};
+});
 
 // PDF 加密与解锁
-$('#btn-pdf-prot-pick').onclick = (e) => { e.stopPropagation(); pickSinglePdf($('#pdf-prot-meta'), $('#btn-pdf-prot-clear'), (p) => state.pdfProtPath = p); };
-bindClearPdf($('#btn-pdf-prot-clear'), $('#pdf-prot-meta'), (p) => state.pdfProtPath = p);
-bindDropSinglePdf($('#pdf-prot-drop'), $('#pdf-prot-meta'), $('#btn-pdf-prot-clear'), (p) => state.pdfProtPath = p);
-$('#btn-pdf-protect-run').onclick = async () => {
+$('#btn-pdf-prot-pick').onclick = (e) => { e.stopPropagation(); pickSinglePdf($('#pdf-prot-meta'), $('#btn-pdf-prot-clear'), (p) => state.pdfProtPath = p, () => state.pdfProtPath); };
+bindClearPdf($('#btn-pdf-prot-clear'), $('#pdf-prot-meta'), (p) => state.pdfProtPath = p, () => state.pdfProtPath);
+bindDropSinglePdf($('#pdf-prot-drop'), $('#pdf-prot-meta'), $('#btn-pdf-prot-clear'), (p) => state.pdfProtPath = p, () => state.pdfProtPath);
+bindAsyncBtn('#btn-pdf-protect-run', async () => {
   if (!state.pdfProtPath) return toast('请先选择 PDF 文件');
+  $('#pdf-result').innerHTML = '';
   try {
     const res = await api('/api/pdf/protect', {
       path: state.pdfProtPath,
@@ -929,9 +1019,10 @@ $('#btn-pdf-protect-run').onclick = async () => {
     });
     renderResultCard($('#pdf-result'), 'PDF 加密完成', res.path, res.name, `${res.pages} 页 · AES-256 · ${fmtBytes(res.output_size)}`);
   } catch (e) { toast(e.message); }
-};
-$('#btn-pdf-unlock-run').onclick = async () => {
+});
+bindAsyncBtn('#btn-pdf-unlock-run', async () => {
   if (!state.pdfProtPath) return toast('请先选择 PDF 文件');
+  $('#pdf-result').innerHTML = '';
   try {
     const res = await api('/api/pdf/unlock', {
       path: state.pdfProtPath,
@@ -939,17 +1030,18 @@ $('#btn-pdf-unlock-run').onclick = async () => {
     });
     renderResultCard($('#pdf-result'), 'PDF 解锁完成', res.path, res.name, `已移除密码与权限限制 · ${res.pages} 页 · ${fmtBytes(res.output_size)}`);
   } catch (e) { toast(e.message); }
-};
+});
 
 // PDF <-> Word 互转
 $('#btn-p2w-pick').onclick = (e) => {
   e.stopPropagation();
-  pickSinglePdf($('#p2w-meta'), $('#btn-p2w-clear'), (p) => state.p2wPath = p);
+  pickSinglePdf($('#p2w-meta'), $('#btn-p2w-clear'), (p) => state.p2wPath = p, () => state.p2wPath);
 };
-bindClearPdf($('#btn-p2w-clear'), $('#p2w-meta'), (p) => state.p2wPath = p);
-bindDropSinglePdf($('#p2w-drop'), $('#p2w-meta'), $('#btn-p2w-clear'), (p) => state.p2wPath = p);
-$('#btn-p2w-run').onclick = async () => {
+bindClearPdf($('#btn-p2w-clear'), $('#p2w-meta'), (p) => state.p2wPath = p, () => state.p2wPath);
+bindDropSinglePdf($('#p2w-drop'), $('#p2w-meta'), $('#btn-p2w-clear'), (p) => state.p2wPath = p, () => state.p2wPath);
+bindAsyncBtn('#btn-p2w-run', async () => {
   if (!state.p2wPath) return toast('请先选择 PDF 文件');
+  $('#pdf-result').innerHTML = '';
   try {
     toast('正在转换 PDF 为 Word，请稍候…');
     const res = await api('/api/pdf/to-word', { path: state.p2wPath });
@@ -957,12 +1049,14 @@ $('#btn-p2w-run').onclick = async () => {
     renderResultCard($('#pdf-result'), 'PDF 转 Word 完成', res.path, res.name,
       `${res.pages} 页 · ${fmtBytes(res.output_size)}${note}`);
   } catch (e) { toast(e.message); }
-};
+});
 
 function setW2pFile(path, name, size) {
+  if (state.w2pPath && state.w2pPath !== path) releaseTempUploads([state.w2pPath]);
   state.w2pPath = path;
   $('#w2p-meta').textContent = size ? `${name}（${fmtBytes(size)}）` : name;
   $('#btn-w2p-clear').style.display = 'inline-flex';
+  $('#pdf-result').innerHTML = '';
 }
 $('#btn-w2p-pick').onclick = async (e) => {
   e.stopPropagation();
@@ -975,22 +1069,23 @@ $('#btn-w2p-pick').onclick = async (e) => {
     if (res.files.length) setW2pFile(res.files[0], res.files[0].split(/[\\/]/).pop(), 0);
   } catch (err) { toast(err.message); }
 };
-bindClearPdf($('#btn-w2p-clear'), $('#w2p-meta'), (p) => state.w2pPath = p);
+bindClearPdf($('#btn-w2p-clear'), $('#w2p-meta'), (p) => state.w2pPath = p, () => state.w2pPath);
 setupDropzone($('#w2p-drop'), async (files) => {
   try {
     const up = await uploadFile(files[0]);
     setW2pFile(up.path, up.name, up.size);
   } catch (err) { toast(err.message); }
 });
-$('#btn-w2p-run').onclick = async () => {
+bindAsyncBtn('#btn-w2p-run', async () => {
   if (!state.w2pPath) return toast('请先选择 Word 文件');
+  $('#pdf-result').innerHTML = '';
   try {
     toast('正在调用本机 Word 导出 PDF…');
     const res = await api('/api/pdf/from-word', { path: state.w2pPath });
     renderResultCard($('#pdf-result'), 'Word 转 PDF 完成', res.path, res.name,
       `${res.pages} 页 · ${fmtBytes(res.output_size)}`);
   } catch (e) { toast(e.message); }
-};
+});
 
 // ==================== 4. 文本与杂项 ====================
 function updateTextStats() {
@@ -1175,7 +1270,7 @@ $('#btn-rn-folder').onclick = async () => {
   if (res.folder) $('#rn-folder').value = res.folder;
 };
 $('#rn-folder').onclick = () => $('#btn-rn-folder').click();
-$('#btn-rn-preview').onclick = async () => {
+bindAsyncBtn('#btn-rn-preview', async () => {
   try {
     const res = await api('/api/rename/preview', {
       folder: $('#rn-folder').value.trim(),
@@ -1202,10 +1297,12 @@ $('#btn-rn-preview').onclick = async () => {
       </tr>`).join('');
     $('#btn-rn-exec').disabled = !(res.changed > 0 && res.conflicts === 0);
   } catch (e) { toast(e.message); }
-};
+});
 $('#btn-rn-exec').onclick = async () => {
-  if (!state.renamePreview) return;
+  const execBtn = $('#btn-rn-exec');
+  if (execBtn.disabled || !state.renamePreview) return;
   if (!confirm(`确定重命名这 ${state.renamePreview.changed} 个文件吗？`)) return;
+  execBtn.disabled = true;
   try {
     const res = await api('/api/rename/execute', {
       folder: state.renamePreview.folder,
@@ -1213,14 +1310,19 @@ $('#btn-rn-exec').onclick = async () => {
     });
     toast(`已成功重命名 ${res.renamed} 个文件`);
     $('#btn-rn-preview').click();
-  } catch (e) { toast(e.message); }
+  } catch (e) {
+    execBtn.disabled = !(state.renamePreview && state.renamePreview.changed > 0 && state.renamePreview.conflicts === 0);
+    toast(e.message);
+  }
 };
 
 // ZIP 中文文件名乱码修复
 function setZipFixFile(path, name, size) {
+  if (state.zipFixPath && state.zipFixPath !== path) releaseTempUploads([state.zipFixPath]);
   state.zipFixPath = path;
   $('#zipfix-meta').textContent = size ? `${name}（${fmtBytes(size)}）` : name;
   $('#btn-zipfix-clear').style.display = 'inline-flex';
+  $('#zipfix-result').innerHTML = '';
 }
 $('#btn-zipfix-pick').onclick = async (e) => {
   e.stopPropagation();
@@ -1231,6 +1333,7 @@ $('#btn-zipfix-pick').onclick = async (e) => {
 };
 $('#btn-zipfix-clear').onclick = (e) => {
   e.stopPropagation();
+  releaseTempUploads([state.zipFixPath]);
   state.zipFixPath = '';
   $('#zipfix-meta').textContent = '';
   $('#btn-zipfix-clear').style.display = 'none';
@@ -1242,8 +1345,9 @@ setupDropzone($('#zipfix-drop'), async (files) => {
     setZipFixFile(up.path, up.name, up.size);
   } catch (err) { toast(err.message); }
 });
-$('#btn-zipfix-run').onclick = async () => {
+bindAsyncBtn('#btn-zipfix-run', async () => {
   if (!state.zipFixPath) return toast('请先选择 ZIP 压缩包');
+  $('#zipfix-result').innerHTML = '';
   try {
     toast('正在修复 ZIP 文件名编码…');
     const res = await api('/api/file/zip-fix', {
@@ -1263,13 +1367,15 @@ $('#btn-zipfix-run').onclick = async () => {
       $('#zipfix-result').insertAdjacentHTML('beforeend', `<div class="code-pre">${listHtml}</div>`);
     }
   } catch (e) { toast(e.message); }
-};
+});
 
 // 文本 / CSV 编码乱码修复
 function setTxtFixFile(path, name, size) {
+  if (state.txtFixPath && state.txtFixPath !== path) releaseTempUploads([state.txtFixPath]);
   state.txtFixPath = path;
   $('#txtfix-meta').textContent = size ? `${name}（${fmtBytes(size)}）` : name;
   $('#btn-txtfix-clear').style.display = 'inline-flex';
+  $('#txtfix-result').innerHTML = '';
 }
 $('#btn-txtfix-pick').onclick = async (e) => {
   e.stopPropagation();
@@ -1284,6 +1390,7 @@ $('#btn-txtfix-pick').onclick = async (e) => {
 };
 $('#btn-txtfix-clear').onclick = (e) => {
   e.stopPropagation();
+  releaseTempUploads([state.txtFixPath]);
   state.txtFixPath = '';
   $('#txtfix-meta').textContent = '';
   $('#btn-txtfix-clear').style.display = 'none';
@@ -1295,8 +1402,9 @@ setupDropzone($('#txtfix-drop'), async (files) => {
     setTxtFixFile(up.path, up.name, up.size);
   } catch (err) { toast(err.message); }
 });
-$('#btn-txtfix-run').onclick = async () => {
+bindAsyncBtn('#btn-txtfix-run', async () => {
   if (!state.txtFixPath) return toast('请先选择文本文件');
+  $('#txtfix-result').innerHTML = '';
   try {
     toast('正在转换编码…');
     const res = await api('/api/file/text-fix', {
@@ -1315,7 +1423,7 @@ $('#btn-txtfix-run').onclick = async () => {
       $('#txtfix-result').insertAdjacentHTML('beforeend', `<div class="code-pre">${escHtml(res.preview)}</div>`);
     }
   } catch (e) { toast(e.message); }
-};
+});
 
 // 文件哈希校验与比对
 function updateHashCompare() {
@@ -1336,9 +1444,11 @@ function updateHashCompare() {
   }
 }
 async function runFileHash(path) {
+  const prevPath = state.hashData?.path;
   try {
     toast('正在计算文件哈希…');
     const res = await api('/api/file/hash', { path });
+    if (prevPath && prevPath !== res.path) releaseTempUploads([prevPath]);
     state.hashData = res;
     $('#hash-meta').textContent = `${res.name}（${fmtBytes(res.size_bytes)}）`;
     const rows = [
@@ -1356,7 +1466,10 @@ async function runFileHash(path) {
       btn.onclick = () => copyText(btn.dataset.val, '已复制哈希值');
     });
     updateHashCompare();
-  } catch (e) { toast(e.message); }
+  } catch (e) {
+    if (path && path !== prevPath) releaseTempUploads([path]);
+    toast(e.message);
+  }
 }
 $('#btn-hash-pick').onclick = async (e) => {
   e.stopPropagation();
@@ -1367,6 +1480,7 @@ $('#btn-hash-pick').onclick = async (e) => {
 };
 $('#btn-hash-clear').onclick = (e) => {
   e.stopPropagation();
+  if (state.hashData?.path) releaseTempUploads([state.hashData.path]);
   state.hashData = null;
   $('#hash-meta').textContent = '';
   $('#hash-values').innerHTML = '';

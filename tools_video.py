@@ -1,5 +1,6 @@
 """视频工坊：ffprobe 编码检测、一键转 Win 通用 MP4（无损换壳/NVENC/x264）、压缩、裁剪、旋转、多视频合并、提音频、转 GIF、批量截图、字幕互转。"""
 import json
+import os
 from pathlib import Path
 import re
 import shutil
@@ -10,10 +11,12 @@ import time
 import uuid
 import zipfile
 
-from tools_files import OUTPUT_DIR, UPLOAD_DIR, clean_stem, ensure_dirs, unique_path
+from tools_files import OUTPUT_DIR, UPLOAD_DIR, clean_stem, ensure_dirs, touch_upload_if_temp, unique_path
 
 _NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 _NVENC_CACHE = None
+DEFAULT_GIF_SECONDS = 6.0
+MAX_GIF_SECONDS = 30.0
 
 
 def ffmpeg_bins():
@@ -161,8 +164,28 @@ class VideoTaskManager:
     def __init__(self):
         self._tasks = {}
         self._queue = []            # [(task_id, cmd, out_path, est_duration, cleanup_paths), ...]
+        self._reserved_outputs = set()
         self._worker_alive = False
         self._lock = threading.Lock()
+
+    def _reserve_output(self, out_dir, stem, ext):
+        with self._lock:
+            out_path = unique_path(out_dir, stem, ext, reserved=self._reserved_outputs)
+            self._reserved_outputs.add(os.path.normcase(str(out_path.resolve())))
+            return out_path
+
+    def _release_reserved_locked(self, out_path):
+        if out_path is not None:
+            self._reserved_outputs.discard(os.path.normcase(str(Path(out_path).resolve())))
+
+    def active_input_paths(self):
+        """返回当前所有排队中或运行中任务正在引用的输入文件路径集合。"""
+        with self._lock:
+            active = set()
+            for t in self._tasks.values():
+                if t.get('status') in ('running', 'queued'):
+                    active.update(t.get('input_paths') or ())
+            return active
 
     def _prune_locked(self):
         finished = [
@@ -186,14 +209,13 @@ class VideoTaskManager:
             task = self._tasks.get(task_id)
             if not task:
                 return None
-            snap = {k: v for k, v in task.items() if k != '_proc'}
+            snap = {k: v for k, v in task.items() if k not in ('_proc', 'input_paths')}
             if snap.get('status') == 'queued':
                 snap['queue_pos'] = self._queue_position_locked(task_id)
             return snap
 
     def cancel(self, task_id):
         cleanup = []
-        out_to_remove = None
         with self._lock:
             task = self._tasks.get(task_id)
             if not task:
@@ -204,7 +226,8 @@ class VideoTaskManager:
                 kept = []
                 for item in self._queue:
                     if item[0] == task_id:
-                        out_to_remove = item[2]
+                        # 排队中尚未启动 FFmpeg 进程，仅释放预留输出名与临时辅助文件，严禁误删磁盘已有文件
+                        self._release_reserved_locked(item[2])
                         cleanup.extend(item[4] or [])
                     else:
                         kept.append(item)
@@ -216,8 +239,6 @@ class VideoTaskManager:
                         proc.terminate()
                     except OSError:
                         pass
-        if out_to_remove is not None:
-            Path(out_to_remove).unlink(missing_ok=True)
         for cp in cleanup:
             Path(cp).unlink(missing_ok=True)
         return True
@@ -225,14 +246,13 @@ class VideoTaskManager:
     def cancel_all(self):
         """退出服务时取消排队任务并终止全部运行中的 FFmpeg 子进程，避免遗留孤儿进程。"""
         cleanup = []
-        outs = []
         with self._lock:
             for tid, _cmd, out_p, _dur, cps in self._queue:
                 t = self._tasks.get(tid)
                 if t:
                     t['cancelled'] = True
                     t['status'] = 'cancelled'
-                outs.append(out_p)
+                self._release_reserved_locked(out_p)
                 cleanup.extend(cps or [])
             self._queue.clear()
             for task in self._tasks.values():
@@ -244,15 +264,16 @@ class VideoTaskManager:
                             proc.terminate()
                         except OSError:
                             pass
-        for out_p in outs:
-            Path(out_p).unlink(missing_ok=True)
         for cp in cleanup:
             Path(cp).unlink(missing_ok=True)
 
     def _enqueue_or_start(self, task, cmd, out_path, est_duration, cleanup_paths=None):
         task_id = task['id']
+        for ip in (task.get('input_paths') or ()):
+            touch_upload_if_temp(ip)
         with self._lock:
             if len(self._queue) >= self.MAX_QUEUE:
+                self._release_reserved_locked(out_path)
                 for cp in (cleanup_paths or []):
                     Path(cp).unlink(missing_ok=True)
                 raise RuntimeError(f'排队中的视频任务已达上限（{self.MAX_QUEUE} 个），请稍后再添加')
@@ -319,6 +340,7 @@ class VideoTaskManager:
             'status': 'queued',
             'progress': 0,
             'speed': '',
+            'source_name': clean_stem(src) + src.suffix,
             'mode_desc': mode_desc,
             'output_path': str(out_path),
             'output_name': out_path.name,
@@ -327,6 +349,7 @@ class VideoTaskManager:
             'error': '',
             'cancelled': False,
             'started_at': time.time(),
+            'input_paths': [str(src.resolve())],
             '_proc': None,
         }
         return self._enqueue_or_start(task, cmd, out_path, est_duration)
@@ -366,7 +389,7 @@ class VideoTaskManager:
         total_dur = sum(i['duration'] or 0.0 for i in infos)
         total_size = sum(i['size_bytes'] or 0 for i in infos)
         out_dir = Path(options.get('output_dir') or OUTPUT_DIR)
-        out_path = unique_path(out_dir, '合并视频', '.mp4')
+        out_path = self._reserve_output(out_dir, '合并视频', '.mp4')
         reencode = bool(options.get('reencode', False))
         use_nvenc = bool(options.get('use_nvenc', True))
         quality = options.get('quality', 'balanced')
@@ -387,11 +410,14 @@ class VideoTaskManager:
                           '-c', 'copy', '-movflags', '+faststart', str(out_path)]
             mode_desc = f'无损快速合并 ({len(paths)} 段视频)'
         else:
-            # 以首个有尺寸的视频为目标画布（保证宽高为偶数）
+            # 以首个有尺寸的视频为目标画布（保证宽高为偶数），并保留最高有效帧率（上限 60fps）
             first_w = next((i['width'] for i in infos if i['width'] > 0), 1280)
             first_h = next((i['height'] for i in infos if i['height'] > 0), 720)
             tw = first_w if first_w % 2 == 0 else first_w + 1
             th = first_h if first_h % 2 == 0 else first_h + 1
+            valid_fps = [i['fps'] for i in infos if (i.get('fps') or 0) > 0]
+            target_fps = min(60.0, max(valid_fps)) if valid_fps else 30.0
+            fps_expr = str(int(round(target_fps))) if abs(target_fps - round(target_fps)) < 0.05 else f'{target_fps:.2f}'
             has_any_audio = any(i['audio_codec'] != '无音轨' for i in infos)
 
             in_args = []
@@ -403,7 +429,7 @@ class VideoTaskManager:
             for idx, info in enumerate(infos):
                 fc_parts.append(
                     f'[{idx}:v:0]scale={tw}:{th}:force_original_aspect_ratio=decrease,'
-                    f'pad={tw}:{th}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,format=yuv420p[v{idx}]'
+                    f'pad={tw}:{th}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps_expr},format=yuv420p[v{idx}]'
                 )
                 concat_inputs.append(f'[v{idx}]')
                 if has_any_audio:
@@ -437,6 +463,7 @@ class VideoTaskManager:
             'status': 'queued',
             'progress': 0,
             'speed': '',
+            'source_name': f'{len(paths)} 段视频合并',
             'mode_desc': mode_desc,
             'output_path': str(out_path),
             'output_name': out_path.name,
@@ -445,6 +472,7 @@ class VideoTaskManager:
             'error': '',
             'cancelled': False,
             'started_at': time.time(),
+            'input_paths': [str(Path(p).resolve()) for p in paths],
             '_proc': None,
         }
         return self._enqueue_or_start(task, cmd, out_path, max(0.5, total_dur), cleanup_paths)
@@ -458,7 +486,7 @@ class VideoTaskManager:
         base = [ffmpeg, '-y', '-hide_banner', '-loglevel', 'error', '-progress', 'pipe:1', '-nostats']
 
         if mode == 'compat':
-            out_path = unique_path(out_dir, f'{stem}_兼容', '.mp4')
+            out_path = self._reserve_output(out_dir, f'{stem}_兼容', '.mp4')
             force_reencode = bool(options.get('force_reencode', False))
             if info['can_remux_video'] and not force_reencode:
                 a_args = ['-c:a', 'copy'] if info['can_remux_audio'] else ['-c:a', 'aac', '-b:a', '192k']
@@ -475,7 +503,7 @@ class VideoTaskManager:
         if mode == 'compress':
             scale_h = int(options.get('max_height') or 0)
             suffix = f'_压缩{scale_h}p' if scale_h else '_压缩'
-            out_path = unique_path(out_dir, f'{stem}{suffix}', '.mp4')
+            out_path = self._reserve_output(out_dir, f'{stem}{suffix}', '.mp4')
             v_args, enc_name = self._video_encoder_args(use_nvenc, quality or 'small', scale_h)
             cmd = base + ['-i', str(src), '-map', '0:v:0', '-map', '0:a?'] + v_args + [
                 '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart', str(out_path)
@@ -487,10 +515,12 @@ class VideoTaskManager:
             end_s = _parse_time_str(options.get('end'))
             start_sec = _time_to_seconds(start_s)
             end_sec = _time_to_seconds(end_s) if end_s else 0.0
+            if duration > 0 and start_sec >= duration:
+                raise ValueError('开始时间超出了视频总时长')
             if end_s and end_sec <= start_sec:
                 raise ValueError('结束时间必须大于开始时间')
             lossless = bool(options.get('lossless', False))
-            out_path = unique_path(out_dir, f'{stem}_裁剪', '.mp4')
+            out_path = self._reserve_output(out_dir, f'{stem}_裁剪', '.mp4')
             pre = ['-ss', start_s] if start_s else []
             # -ss 置于 -i 之前时会重置时间轴为 0，因此用 -t 指定截取时长而非 -to
             if end_s:
@@ -517,7 +547,7 @@ class VideoTaskManager:
             afmt = (options.get('audio_format') or 'mp3').lower()
             if afmt not in ('mp3', 'm4a', 'wav'):
                 afmt = 'mp3'
-            out_path = unique_path(out_dir, f'{stem}_音频', f'.{afmt}')
+            out_path = self._reserve_output(out_dir, f'{stem}_音频', f'.{afmt}')
             if afmt == 'mp3':
                 a_args = ['-vn', '-c:a', 'libmp3lame', '-b:a', '192k']
             elif afmt == 'm4a':
@@ -532,25 +562,30 @@ class VideoTaskManager:
             end_s = _parse_time_str(options.get('end'))
             start_sec = _time_to_seconds(start_s)
             end_sec = _time_to_seconds(end_s) if end_s else 0.0
+            if duration > 0 and start_sec >= duration:
+                raise ValueError('开始时间超出了视频总时长')
             if end_s and end_sec <= start_sec:
                 raise ValueError('结束时间必须大于开始时间')
-            fps = max(5, min(24, int(options.get('fps') or 12)))
-            width = max(160, min(960, int(options.get('width') or 480)))
-            out_path = unique_path(out_dir, f'{stem}_动图', '.gif')
-            pre = ['-ss', start_s] if start_s else []
             if end_s:
                 clip_dur = end_sec - start_sec
-                post = ['-t', f'{clip_dur:.3f}']
-                est = max(0.5, clip_dur)
+                if clip_dur > MAX_GIF_SECONDS:
+                    raise ValueError(f'GIF 单次截取时长上限为 {int(MAX_GIF_SECONDS)} 秒（过长会耗尽内存），请缩短起止时间')
             else:
-                post = []
-                est = max(0.5, min(duration - start_sec, 30.0))
+                rem = (duration - start_sec) if duration > start_sec else DEFAULT_GIF_SECONDS
+                clip_dur = max(0.2, min(rem, DEFAULT_GIF_SECONDS))
+            fps = max(5, min(24, int(options.get('fps') or 12)))
+            width = max(160, min(960, int(options.get('width') or 480)))
+            out_path = self._reserve_output(out_dir, f'{stem}_动图', '.gif')
+            pre = ['-ss', start_s] if start_s else []
+            # 无论是否填写结束时间，均强制传入 -t 截断上限，防止长视频全量帧进入 palettegen 撑爆内存
+            post = ['-t', f'{clip_dur:.3f}']
+            est = max(0.5, clip_dur)
             vf = (
                 f'fps={fps},scale={width}:-1:flags=lanczos,'
                 'split[s0][s1];[s0]palettegen=stats_mode=diff[p];[s1][p]paletteuse=dither=bayer'
             )
             cmd = base + pre + ['-i', str(src)] + post + ['-vf', vf, '-loop', '0', str(out_path)]
-            return cmd, out_path, f'生成高清 GIF ({width}px / {fps}fps)', est
+            return cmd, out_path, f'生成高清 GIF ({width}px / {fps}fps / {clip_dur:.1f}s)', est
 
         if mode == 'rotate':
             rot_map = {
@@ -564,7 +599,7 @@ class VideoTaskManager:
             if op not in rot_map:
                 raise ValueError(f'不支持的视频旋转/翻转方式: {op}')
             rot_vf, label = rot_map[op]
-            out_path = unique_path(out_dir, f'{stem}_旋转', '.mp4')
+            out_path = self._reserve_output(out_dir, f'{stem}_旋转', '.mp4')
             v_args, enc_name = self._video_encoder_args(use_nvenc, quality, extra_vf=[rot_vf])
             a_args = ['-c:a', 'copy'] if info['can_remux_audio'] else ['-c:a', 'aac', '-b:a', '192k']
             cmd = base + ['-i', str(src), '-map', '0:v:0', '-map', '0:a?'] + v_args + a_args + [
@@ -633,7 +668,10 @@ class VideoTaskManager:
             with self._lock:
                 self._tasks[task_id]['status'] = 'error'
                 self._tasks[task_id]['error'] = str(err)
+            Path(out_path).unlink(missing_ok=True)
         finally:
+            with self._lock:
+                self._release_reserved_locked(out_path)
             for cp in (cleanup_paths or []):
                 try:
                     Path(cp).unlink(missing_ok=True)

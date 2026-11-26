@@ -328,6 +328,21 @@ textarea { resize: vertical; min-height: 140px; font-family: Consolas, "Cascadia
   transition: width 0.25s ease;
 }
 
+.task-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.task-card {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px 14px;
+}
+.task-card .progress-wrap {
+  background: var(--surface);
+}
+
 /* 文件列表 */
 .file-list {
   display: flex;
