@@ -5,6 +5,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 import mimetypes
 from pathlib import Path
+import re
 import secrets
 import sys
 import threading
@@ -63,6 +64,15 @@ class PathForbiddenError(PermissionError):
     """请求访问未经上传、输出或系统弹窗授权的本地路径时抛出。"""
 
 
+_WIN_PATH_RE = re.compile(r'[A-Za-z]:\\[^\s\'"]+')
+
+
+def _sanitize_error_msg(err):
+    """剥离业务提示中可能夹带的本机盘符绝对路径，防止向前端暴露目录结构。"""
+    msg = _WIN_PATH_RE.sub('<本地路径>', str(err or '').strip())
+    return msg[:240] or '请求参数有误'
+
+
 class ToolboxHandler(BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
 
@@ -116,6 +126,8 @@ class ToolboxHandler(BaseHTTPRequestHandler):
         self.send_header('Content-Type', 'application/json; charset=utf-8')
         self.send_header('Content-Length', str(len(body)))
         self.send_header('Cache-Control', 'no-store')
+        if getattr(self, 'close_connection', False):
+            self.send_header('Connection', 'close')
         self.end_headers()
         self.wfile.write(body)
 
@@ -365,9 +377,11 @@ class ToolboxHandler(BaseHTTPRequestHandler):
                 return
 
             self._serve_static(path)
-        except Exception as err:
-            log.exception('GET %s 异常', path)
-            self._send_json({'error': str(err)}, 500)
+        except (ValueError, FileNotFoundError, RuntimeError) as err:
+            self._send_json({'error': _sanitize_error_msg(err)}, 400)
+        except Exception:
+            log.exception('GET %s 未预期内部异常', path)
+            self._send_json({'error': '服务内部处理失败，详情已记录至本地日志'}, 500)
 
     def do_POST(self):
         if not self._check_host() or not self._check_post_auth():
@@ -437,10 +451,11 @@ class ToolboxHandler(BaseHTTPRequestHandler):
 
             if path == '/api/shutdown':
                 video_tasks.cancel_all()
+                self.close_connection = True
                 self._send_json({'ok': True})
                 on_shutdown = getattr(self.server, 'on_shutdown', None)
                 if callable(on_shutdown):
-                    threading.Thread(target=on_shutdown, daemon=True).start()
+                    on_shutdown()
                 threading.Thread(target=self.server.shutdown, daemon=True).start()
                 return
 
@@ -646,10 +661,13 @@ class ToolboxHandler(BaseHTTPRequestHandler):
             self._send_json({'error': '未知接口'}, 404)
         except PathForbiddenError as err:
             log.warning('POST %s 未授权路径被拦截: %s', path, err)
-            self._send_json({'error': str(err)}, 403)
-        except Exception as err:
-            log.warning('POST %s 失败: %s', path, err)
-            self._send_json({'error': str(err)}, 400)
+            self._send_json({'error': _sanitize_error_msg(err)}, 403)
+        except (ValueError, FileNotFoundError, RuntimeError) as err:
+            log.warning('POST %s 业务校验未通过: %s', path, err)
+            self._send_json({'error': _sanitize_error_msg(err)}, 400)
+        except Exception:
+            log.exception('POST %s 未预期内部异常', path)
+            self._send_json({'error': '服务内部处理失败，详情已记录至本地日志'}, 500)
 
 
 def create_server(start_port=DEFAULT_PORT):

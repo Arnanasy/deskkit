@@ -176,6 +176,18 @@ class TestToolsFiles(unittest.TestCase):
             with self.assertRaises(ValueError):
                 tools_files.fix_text_encoding(str(csv_path), target_encoding='invalid-enc', out_dir=base)
 
+            # 二进制文件与无法解码的未知编码字节流不得静默回退 latin1 制造乱码，必须抛 ValueError
+            bin_path = base / 'binary.dat'
+            bin_path.write_bytes(b'MZ\x90\x00\x03\x00\x00\x00binary')
+            with self.assertRaises(ValueError):
+                tools_files.fix_text_encoding(str(bin_path), source_encoding='auto', out_dir=base)
+
+            undecodable = base / 'bad_bytes.txt'
+            # 构造同时非法于 UTF-8 / GB18030 / Big5 / Shift_JIS 的孤立高位字节序列
+            undecodable.write_bytes(b'\x80\xff\xfe\x81\xff')
+            with self.assertRaises(ValueError):
+                tools_files.fix_text_encoding(str(undecodable), source_encoding='auto', out_dir=base)
+
     def test_calc_file_hash_normal_and_empty_file(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp) / '哈希测试'
@@ -234,6 +246,39 @@ class TestToolsImage(unittest.TestCase):
             # 再把 AVIF 转回 PNG
             res2 = tools_image.process_convert_compress([str(avif_path)], target_fmt='png', out_dir=base)
             self.assertTrue(Path(res2['files'][0]['path']).exists())
+
+    def test_heic_read_and_ffmpeg_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp) / '苹果相册'
+            base.mkdir()
+            heic_path = base / '照片样本.heic'
+
+            # 1. 若安装了 pillow-heif，实测真实 HEIC 编码 -> 读取转 JPG 闭环
+            has_heif = False
+            try:
+                import pillow_heif
+                pillow_heif.register_heif_opener()
+                has_heif = True
+            except Exception:
+                pass
+
+            if has_heif:
+                Image.new('RGB', (48, 36), (220, 80, 40)).save(heic_path, format='HEIF', quality=80)
+                res = tools_image.process_convert_compress([str(heic_path)], target_fmt='keep', out_dir=base)
+                jpg_out = Path(res['files'][0]['path'])
+                self.assertEqual(jpg_out.suffix.lower(), '.jpg')
+                with Image.open(jpg_out) as im:
+                    self.assertEqual(im.size, (48, 36))
+
+            # 2. 模拟 Pillow 无法直接打开 HEIC 时自动回退 _decode_via_ffmpeg
+            fake_heic = base / '回退测试.heic'
+            fake_heic.write_bytes(b'fake_heic')
+            fallback_img = Image.new('RGB', (32, 32), (10, 200, 100))
+            with mock.patch.object(tools_image.Image, 'open', side_effect=OSError('cannot identify')), \
+                 mock.patch.object(tools_image, '_decode_via_ffmpeg', return_value=fallback_img) as fb_mock:
+                opened = tools_image._open_oriented(fake_heic)
+                self.assertEqual(opened.size, (32, 32))
+                fb_mock.assert_called_once()
 
     def test_rotate_flip_and_split_image(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -572,6 +617,61 @@ class TestServerAndTray(unittest.TestCase):
                     timeout=3,
                 ) as ok_prev:
                     self.assertEqual(ok_prev.read(), b'hello')
+
+            # 6. /api/upload 流式上传（中文文件名、自动通过白名单计算哈希、超限 413 拦截）与未预期异常脱敏验证
+            uploaded_temp = None
+            try:
+                payload_bytes = '流式上传中文内容测试 12345'.encode('utf-8')
+                up_req = Request(
+                    f"http://127.0.0.1:{port}/api/upload?name={quote('测试上传文档.txt')}",
+                    data=payload_bytes,
+                    headers={'X-Toolbox-Token': tok, 'Content-Length': str(len(payload_bytes))},
+                    method='POST',
+                )
+                with urlopen(up_req, timeout=3) as up_resp:
+                    up_data = json.loads(up_resp.read().decode('utf-8'))
+                uploaded_temp = Path(up_data['path'])
+                self.assertTrue(uploaded_temp.exists())
+                self.assertEqual(up_data['name'], '测试上传文档.txt')
+
+                # 上传目录内的文件无需额外 pick-files 即可直接通过白名单计算哈希
+                hash_req = Request(
+                    f'http://127.0.0.1:{port}/api/file/hash',
+                    data=json.dumps({'path': str(uploaded_temp)}).encode('utf-8'),
+                    headers={'Content-Type': 'application/json', 'X-Toolbox-Token': tok},
+                    method='POST',
+                )
+                with urlopen(hash_req, timeout=3) as h_resp:
+                    h_data = json.loads(h_resp.read().decode('utf-8'))
+                self.assertEqual(h_data['md5'], hashlib.md5(payload_bytes).hexdigest())
+
+                # 超出 4GB 上限的 Content-Length 应立即返回 413
+                huge_req = Request(
+                    f'http://127.0.0.1:{port}/api/upload?name=huge.bin',
+                    data=b'x',
+                    headers={'X-Toolbox-Token': tok, 'Content-Length': str(server.MAX_UPLOAD_BYTES + 10)},
+                    method='POST',
+                )
+                with self.assertRaises(HTTPError) as ctx_413:
+                    urlopen(huge_req, timeout=3)
+                self.assertEqual(ctx_413.exception.code, 413)
+
+                # 模拟内部抛出未预期 KeyError（含敏感路径），前端只能收到 500 通用脱敏提示
+                with mock.patch.object(server, 'calc_file_hash', side_effect=KeyError(r'C:\Users\secret_internal_key')):
+                    err_req = Request(
+                        f'http://127.0.0.1:{port}/api/file/hash',
+                        data=json.dumps({'path': str(uploaded_temp)}).encode('utf-8'),
+                        headers={'Content-Type': 'application/json', 'X-Toolbox-Token': tok},
+                        method='POST',
+                    )
+                    with self.assertRaises(HTTPError) as ctx_500:
+                        urlopen(err_req, timeout=3)
+                    self.assertEqual(ctx_500.exception.code, 500)
+                    err_body = ctx_500.exception.read().decode('utf-8')
+                    self.assertNotIn('secret_internal_key', err_body)
+            finally:
+                if uploaded_temp is not None:
+                    uploaded_temp.unlink(missing_ok=True)
         finally:
             httpd.shutdown()
             httpd.server_close()

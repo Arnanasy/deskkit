@@ -471,6 +471,8 @@ def fix_text_encoding(path_str, source_encoding='auto', target_encoding='utf-8',
         elif raw.startswith((b'\xff\xfe', b'\xfe\xff')):
             detected, text = 'utf-16', raw.decode('utf-16')
         else:
+            if b'\x00' in raw[:8192]:
+                raise ValueError('检测到二进制文件内容，请选择纯文本或 CSV 文件')
             for enc in ('utf-8', 'gb18030', 'big5', 'shift_jis'):
                 try:
                     text = raw.decode(enc)
@@ -479,15 +481,14 @@ def fix_text_encoding(path_str, source_encoding='auto', target_encoding='utf-8',
                 except UnicodeDecodeError:
                     continue
             if text is None:
-                detected = 'latin1'
-                text = raw.decode('latin1')
+                raise ValueError('无法自动识别该文件的文本编码，请手动选择原文件编码后重试')
     else:
         try:
             text = raw.decode(source_encoding)
         except LookupError:
             raise ValueError(f'不支持的源编码: {source_encoding}')
-        except UnicodeDecodeError as err:
-            raise ValueError(f'使用 {source_encoding} 解码失败: {err}')
+        except UnicodeDecodeError:
+            raise ValueError(f'无法使用 {source_encoding} 编码解析该文件，请尝试其他源编码')
 
     out_dir = Path(out_dir or OUTPUT_DIR)
     ext = src.suffix or '.txt'

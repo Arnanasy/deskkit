@@ -64,7 +64,7 @@ def probe_video(path_str):
         raise RuntimeError('未找到 ffprobe，请确认已安装 FFmpeg')
     path = Path(path_str)
     if not path.exists():
-        raise FileNotFoundError(f'文件不存在: {path}')
+        raise FileNotFoundError('视频文件不存在')
     run = subprocess.run(
         [ffprobe, '-v', 'quiet', '-print_format', 'json', '-show_format', '-show_streams', str(path)],
         capture_output=True, text=True, encoding='utf-8', timeout=15, creationflags=_NO_WINDOW,
@@ -338,14 +338,8 @@ class VideoTaskManager:
             vf.append(f'scale=-2:min(ih\\,{int(scale_height)})')
         vf.append('format=yuv420p')
         vf_args = ['-vf', ','.join(vf)]
-
-        if use_nvenc and has_nvenc():
-            cq_map = {'high': '21', 'balanced': '25', 'small': '30'}
-            cq = cq_map.get(quality, '25')
-            return vf_args + ['-c:v', 'h264_nvenc', '-preset', 'p5', '-rc', 'vbr', '-cq', cq, '-b:v', '0'], 'NVENC 显卡硬编'
-        crf_map = {'high': '19', 'balanced': '23', 'small': '28'}
-        crf = crf_map.get(quality, '23')
-        return vf_args + ['-c:v', 'libx264', '-preset', 'medium', '-crf', crf], 'x264 CPU 编码'
+        enc_args, enc_name = self._raw_encoder_args(use_nvenc, quality)
+        return vf_args + enc_args, enc_name
 
     def _raw_encoder_args(self, use_nvenc, quality):
         """仅返回视频编码器参数（不含 -vf），用于已由 filter_complex 处理滤镜链的场景。"""
