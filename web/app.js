@@ -1265,10 +1265,14 @@ function scheduleRegex() {
 $('#rx-pat').oninput = scheduleRegex;
 $('#rx-text').oninput = scheduleRegex;
 
-$('#btn-rn-folder').onclick = async () => {
-  const res = await api('/api/pick-folder', { title: '选择要批量重命名的文件夹' });
-  if (res.folder) $('#rn-folder').value = res.folder;
-};
+bindAsyncBtn('#btn-rn-folder', async () => {
+  try {
+    const res = await api('/api/pick-folder', { title: '选择要批量重命名的文件夹' });
+    if (res.folder) $('#rn-folder').value = res.folder;
+  } catch (err) {
+    toast(err.message || '选择文件夹失败，请刷新页面重试');
+  }
+});
 $('#rn-folder').onclick = () => $('#btn-rn-folder').click();
 bindAsyncBtn('#btn-rn-preview', async () => {
   try {

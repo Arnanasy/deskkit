@@ -179,12 +179,13 @@ class VideoTaskManager:
             self._reserved_outputs.discard(os.path.normcase(str(Path(out_path).resolve())))
 
     def active_input_paths(self):
-        """返回当前所有排队中或运行中任务正在引用的输入文件路径集合。"""
+        """返回当前所有排队中或运行中任务正在引用的输入文件及辅助临时文件路径集合。"""
         with self._lock:
             active = set()
             for t in self._tasks.values():
                 if t.get('status') in ('running', 'queued'):
                     active.update(t.get('input_paths') or ())
+                    active.update(t.get('cleanup_paths') or ())
             return active
 
     def _prune_locked(self):
@@ -240,7 +241,10 @@ class VideoTaskManager:
                     except OSError:
                         pass
         for cp in cleanup:
-            Path(cp).unlink(missing_ok=True)
+            try:
+                Path(cp).unlink(missing_ok=True)
+            except OSError:
+                pass
         return True
 
     def cancel_all(self):
@@ -265,17 +269,27 @@ class VideoTaskManager:
                         except OSError:
                             pass
         for cp in cleanup:
-            Path(cp).unlink(missing_ok=True)
+            try:
+                Path(cp).unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def _enqueue_or_start(self, task, cmd, out_path, est_duration, cleanup_paths=None):
         task_id = task['id']
+        if cleanup_paths:
+            task['cleanup_paths'] = [str(Path(cp).resolve()) for cp in cleanup_paths]
         for ip in (task.get('input_paths') or ()):
             touch_upload_if_temp(ip)
+        for cp in (cleanup_paths or ()):
+            touch_upload_if_temp(cp)
         with self._lock:
             if len(self._queue) >= self.MAX_QUEUE:
                 self._release_reserved_locked(out_path)
                 for cp in (cleanup_paths or []):
-                    Path(cp).unlink(missing_ok=True)
+                    try:
+                        Path(cp).unlink(missing_ok=True)
+                    except OSError:
+                        pass
                 raise RuntimeError(f'排队中的视频任务已达上限（{self.MAX_QUEUE} 个），请稍后再添加')
             self._prune_locked()
             running = sum(1 for t in self._tasks.values() if t.get('status') == 'running')
@@ -308,21 +322,33 @@ class VideoTaskManager:
 
     def _worker_loop(self, current_job):
         job = current_job
-        while job is not None:
-            task_id, cmd, out_path, est_duration, cleanup_paths = job
-            self._run_task(task_id, cmd, out_path, est_duration, cleanup_paths)
-            job = None
+        try:
+            while job is not None:
+                task_id, cmd, out_path, est_duration, cleanup_paths = job
+                try:
+                    self._run_task(task_id, cmd, out_path, est_duration, cleanup_paths)
+                except Exception as err:
+                    with self._lock:
+                        t = self._tasks.get(task_id)
+                        if t and t.get('status') == 'running':
+                            t['status'] = 'error'
+                            t['error'] = str(err)
+                        self._release_reserved_locked(out_path)
+                job = None
+                with self._lock:
+                    while self._queue:
+                        cand = self._queue.pop(0)
+                        t = self._tasks.get(cand[0])
+                        if t and not t.get('cancelled'):
+                            t['status'] = 'running'
+                            t['started_at'] = time.time()
+                            job = cand
+                            break
+                    if job is None:
+                        self._worker_alive = False
+        finally:
             with self._lock:
-                while self._queue:
-                    cand = self._queue.pop(0)
-                    t = self._tasks.get(cand[0])
-                    if t and not t.get('cancelled'):
-                        t['status'] = 'running'
-                        t['started_at'] = time.time()
-                        job = cand
-                        break
-                if job is None:
-                    self._worker_alive = False
+                self._worker_alive = False
 
     def start(self, path_str, mode, options=None):
         ffmpeg, _ = ffmpeg_bins()
@@ -654,7 +680,10 @@ class VideoTaskManager:
                 task = self._tasks[task_id]
                 if task['cancelled']:
                     task['status'] = 'cancelled'
-                    out_path.unlink(missing_ok=True)
+                    try:
+                        out_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
                 elif proc.returncode == 0 and out_path.exists():
                     task['status'] = 'done'
                     task['progress'] = 100
@@ -663,12 +692,18 @@ class VideoTaskManager:
                 else:
                     task['status'] = 'error'
                     task['error'] = ' | '.join(stderr_lines[-3:]) or f'FFmpeg 返回错误码 {proc.returncode}'
-                    out_path.unlink(missing_ok=True)
+                    try:
+                        out_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
         except Exception as err:
             with self._lock:
                 self._tasks[task_id]['status'] = 'error'
                 self._tasks[task_id]['error'] = str(err)
-            Path(out_path).unlink(missing_ok=True)
+            try:
+                Path(out_path).unlink(missing_ok=True)
+            except OSError:
+                pass
         finally:
             with self._lock:
                 self._release_reserved_locked(out_path)
@@ -721,14 +756,37 @@ def export_video_frames(path_str, mode='interval', interval=2.0, count=10,
     q_args = ['-q:v', '2'] if ext == '.jpg' else []
 
     with tempfile.TemporaryDirectory(prefix='tb_frames_') as tmp:
-        pattern = str(Path(tmp) / f'frame_%04d{ext}')
-        cmd = [ffmpeg, '-y', '-hide_banner', '-loglevel', 'error'] + pre + [
-            '-i', str(src),
-        ] + post + ['-vf', vf_chain] + q_args + limit_args + [pattern]
-        run = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8',
-                             errors='replace', timeout=120, creationflags=_NO_WINDOW)
-        if run.returncode != 0:
-            raise RuntimeError(run.stderr.strip() or '视频截图导出失败')
+        # 长视频按张数均匀截图时，改用输入前 -ss 关键帧秒级定位抽帧，避免全片软解超时
+        if mode == 'count' and span > 90 and n <= 60:
+            step = span / max(1, n)
+            for idx in range(n):
+                ts = start_sec + step * (idx + 0.5)
+                if duration > 0:
+                    ts = min(max(0.0, ts), max(0.0, duration - 0.05))
+                out_f = str(Path(tmp) / f'frame_{idx + 1:04d}{ext}')
+                vf_single = ['-vf', 'format=yuvj420p'] if ext == '.jpg' else []
+                cmd = [ffmpeg, '-y', '-hide_banner', '-loglevel', 'error',
+                       '-ss', f'{ts:.3f}', '-i', str(src), '-frames:v', '1'] + vf_single + q_args + [out_f]
+                try:
+                    run = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8',
+                                         errors='replace', timeout=30, creationflags=_NO_WINDOW)
+                except subprocess.TimeoutExpired:
+                    raise RuntimeError('视频截图单帧定位超时，请尝试缩短时间范围或减少截图张数')
+                if run.returncode != 0:
+                    raise RuntimeError(run.stderr.strip() or '视频截图导出失败')
+        else:
+            pattern = str(Path(tmp) / f'frame_%04d{ext}')
+            cmd = [ffmpeg, '-y', '-hide_banner', '-loglevel', 'error'] + pre + [
+                '-i', str(src),
+            ] + post + ['-vf', vf_chain] + q_args + limit_args + [pattern]
+            timeout_sec = max(120, min(600, int(span * 0.4) + 120))
+            try:
+                run = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8',
+                                     errors='replace', timeout=timeout_sec, creationflags=_NO_WINDOW)
+            except subprocess.TimeoutExpired:
+                raise RuntimeError('视频截图处理超时（视频较长或分辨率较高），建议缩小起止时间范围后重试')
+            if run.returncode != 0:
+                raise RuntimeError(run.stderr.strip() or '视频截图导出失败')
         frames = sorted(Path(tmp).glob(f'frame_*{ext}'))
         if not frames:
             raise RuntimeError('未截取到任何画面帧，请检查时间范围或视频时长')
@@ -762,7 +820,7 @@ def export_video_frames(path_str, mode='interval', interval=2.0, count=10,
 # ==================== 字幕格式互转（SRT / VTT / ASS） ====================
 
 def _decode_text_bytes(raw_bytes):
-    """按 BOM 优先与常见中文/国际编码顺序自动解码文本字节。"""
+    """按 BOM 优先与常见中文/国际编码智能评分顺序解码文本字节（避免 Big5 繁体被误判为 GB18030）。"""
     if raw_bytes.startswith(b'\xef\xbb\xbf'):
         try:
             return raw_bytes.decode('utf-8-sig'), 'utf-8-sig'
@@ -773,7 +831,11 @@ def _decode_text_bytes(raw_bytes):
             return raw_bytes.decode('utf-16'), 'utf-16'
         except UnicodeDecodeError:
             pass
-    for enc in ('utf-8', 'gb18030', 'utf-16', 'big5'):
+    from tools_files import _detect_legacy_encoding
+    det_enc, det_txt = _detect_legacy_encoding(raw_bytes)
+    if det_enc and det_txt is not None:
+        return det_txt, det_enc
+    for enc in ('utf-16', 'utf-8'):
         try:
             return raw_bytes.decode(enc), enc
         except UnicodeDecodeError:

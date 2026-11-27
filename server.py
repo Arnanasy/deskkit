@@ -1,4 +1,5 @@
 """DeskKit 本地 HTTP 服务（纯 Python 标准库，仅监听 127.0.0.1，带 Host/Token/CSP 防护）。"""
+from collections import Counter
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import logging
@@ -47,12 +48,19 @@ CSP_HEADER = (
 )
 
 def _resolve_log_path():
-    """选择可写的错误日志路径（若安装目录如 Program Files 只读，自动回退到用户临时目录）。"""
+    """选择可写的错误日志路径（Windows 上 os.access(W_OK) 对目录不准确，改用真实试写探测，只读时回退临时目录）。"""
     primary = APP_DIR / 'DeskKit_error.log'
-    target_check = primary if primary.exists() else APP_DIR
-    if os.access(target_check, os.W_OK):
+    try:
+        if primary.exists():
+            with open(primary, 'a', encoding='utf-8'):
+                pass
+        else:
+            probe = APP_DIR / f'.deskkit_write_probe_{os.getpid()}'
+            probe.write_bytes(b'')
+            probe.unlink(missing_ok=True)
         return primary
-    return Path(tempfile.gettempdir()) / 'DeskKit_error.log'
+    except OSError:
+        return Path(tempfile.gettempdir()) / 'DeskKit_error.log'
 
 
 log = logging.getLogger('toolbox')
@@ -397,18 +405,68 @@ class ToolboxHandler(BaseHTTPRequestHandler):
             log.exception('GET %s 未预期内部异常', path)
             self._send_json({'error': '服务内部处理失败，详情已记录至本地日志'}, 500)
 
+    def _active_protected_paths(self):
+        """汇总视频队列及当前正在处理的同步请求所引用的本地路径，防并发清理误删。"""
+        protected = set(video_tasks.active_input_paths())
+        lock = getattr(self.server, 'in_use_lock', None)
+        counter = getattr(self.server, 'in_use_paths', None)
+        if lock is not None and counter is not None:
+            with lock:
+                protected.update(p for p, c in counter.items() if c > 0)
+        return protected
+
+    def _acquire_req_paths(self, data):
+        lock = getattr(self.server, 'in_use_lock', None)
+        counter = getattr(self.server, 'in_use_paths', None)
+        if lock is None or counter is None or not isinstance(data, dict):
+            return []
+        raw_list = []
+        if isinstance(data.get('path'), str):
+            raw_list.append(data['path'])
+        if isinstance(data.get('paths'), list):
+            raw_list.extend(p for p in data['paths'] if isinstance(p, str))
+        acquired = []
+        for raw_p in raw_list:
+            if not raw_p.strip():
+                continue
+            try:
+                norm = str(Path(raw_p).resolve())
+                acquired.append(norm)
+            except OSError:
+                pass
+        if acquired:
+            with lock:
+                for p in acquired:
+                    counter[p] += 1
+        return acquired
+
+    def _release_req_paths(self, acquired):
+        if not acquired:
+            return
+        lock = getattr(self.server, 'in_use_lock', None)
+        counter = getattr(self.server, 'in_use_paths', None)
+        if lock is None or counter is None:
+            return
+        with lock:
+            for p in acquired:
+                counter[p] -= 1
+                if counter[p] <= 0:
+                    counter.pop(p, None)
+
     def do_POST(self):
         if not self._check_host() or not self._check_post_auth():
             return
         parsed = urlparse(self.path)
         path = parsed.path
         qs = parse_qs(parsed.query)
+        acquired_paths = []
         try:
             # 流式二进制上传（兼容大文件，限制上限并清理中断与过期残留）
             if path == '/api/upload':
                 ensure_dirs()
-                maybe_cleanup_uploads(protected_paths=video_tasks.active_input_paths())
-                raw_name = unquote(qs.get('name', ['file'])[0])
+                maybe_cleanup_uploads(protected_paths=self._active_protected_paths())
+                # parse_qs 已完成一次 URL 解码，严禁再次 unquote 导致 50%41 被误解为 50A
+                raw_name = qs.get('name', ['file'])[0]
                 safe = safe_filename(Path(raw_name).name)
                 token = uuid.uuid4().hex[:8]
                 target = UPLOAD_DIR / f'{UPLOAD_PREFIX}{token}_{safe}'
@@ -436,6 +494,8 @@ class ToolboxHandler(BaseHTTPRequestHandler):
                 return
 
             data = self._read_json()
+            if path != '/api/cleanup-uploads':
+                acquired_paths = self._acquire_req_paths(data)
 
             # ---- 系统与文件操作 ----
             if path == '/api/pick-files':
@@ -466,20 +526,23 @@ class ToolboxHandler(BaseHTTPRequestHandler):
                 return
 
             if path == '/api/cleanup-uploads':
-                # 前端移除文件或清空列表时，即时回收不再被后台队列引用的上传临时副本
+                # 前端移除文件或清空列表时，即时回收不再被后台队列或同步请求引用的上传临时副本（被占用则安全跳过）
                 active_norm = {
                     os.path.normcase(str(Path(p).resolve()))
-                    for p in video_tasks.active_input_paths()
+                    for p in self._active_protected_paths()
                 }
                 removed = 0
                 for raw_p in (data.get('paths') or []):
                     if not isinstance(raw_p, str) or not raw_p.strip():
                         continue
-                    cand = Path(raw_p).resolve()
-                    if is_within(cand, UPLOAD_DIR) and cand.is_file():
-                        if os.path.normcase(str(cand)) not in active_norm:
-                            cand.unlink(missing_ok=True)
-                            removed += 1
+                    try:
+                        cand = Path(raw_p).resolve()
+                        if is_within(cand, UPLOAD_DIR) and cand.is_file():
+                            if os.path.normcase(str(cand)) not in active_norm:
+                                cand.unlink(missing_ok=True)
+                                removed += 1
+                    except OSError:
+                        pass
                 self._send_json({'ok': True, 'removed': removed})
                 return
 
@@ -697,12 +760,24 @@ class ToolboxHandler(BaseHTTPRequestHandler):
         except PathForbiddenError as err:
             log.warning('POST %s 未授权路径被拦截: %s', path, err)
             self._send_json({'error': _sanitize_error_msg(err)}, 403)
+        except PermissionError as err:
+            log.warning('POST %s 文件被占用或无权限: %s', path, err)
+            self._send_json({'error': '目标文件正被其他程序占用或无写入权限，请先关闭占用软件后重试'}, 400)
+        except OSError as err:
+            if getattr(err, 'winerror', None) in (5, 32, 33):
+                log.warning('POST %s 文件被占用: %s', path, err)
+                self._send_json({'error': '目标文件正被其他程序占用，请先关闭占用软件后重试'}, 400)
+            else:
+                log.exception('POST %s 系统 I/O 异常', path)
+                self._send_json({'error': '服务内部处理失败，详情已记录至本地日志'}, 500)
         except (ValueError, FileNotFoundError, RuntimeError) as err:
             log.warning('POST %s 业务校验未通过: %s', path, err)
             self._send_json({'error': _sanitize_error_msg(err)}, 400)
         except Exception:
             log.exception('POST %s 未预期内部异常', path)
             self._send_json({'error': '服务内部处理失败，详情已记录至本地日志'}, 500)
+        finally:
+            self._release_req_paths(acquired_paths)
 
 
 def create_server(start_port=DEFAULT_PORT):
@@ -715,6 +790,8 @@ def create_server(start_port=DEFAULT_PORT):
             httpd.api_token = secrets.token_hex(16)
             httpd.allowed_paths = set()
             httpd.allowed_folders = set()
+            httpd.in_use_paths = Counter()
+            httpd.in_use_lock = threading.Lock()
             httpd.on_shutdown = None
             return httpd, port
         except OSError:

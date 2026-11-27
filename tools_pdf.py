@@ -284,6 +284,8 @@ def _word_convert(src_path, dst_path, wd_format):
     import uuid
 
     pid_file = Path(tempfile.gettempdir()) / f'toolbox_word_{uuid.uuid4().hex[:8]}.pid'
+    # 将参数写入临时 .ps1 脚本文件执行，避免 -Command 按空格拆分含空格路径
+    ps_script_file = Path(tempfile.gettempdir()) / f'toolbox_word_{uuid.uuid4().hex[:8]}.ps1'
     ps_script = (
         '$ErrorActionPreference = "Stop"\n'
         '$src = [System.IO.Path]::GetFullPath($args[0]); $dst = [System.IO.Path]::GetFullPath($args[1])\n'
@@ -330,14 +332,16 @@ def _word_convert(src_path, dst_path, wd_format):
         '}\n'
     )
     try:
+        ps_script_file.write_text(ps_script, encoding='utf-8')
         proc = subprocess.Popen(
-            ['powershell.exe', '-NoProfile', '-NonInteractive', '-STA', '-Command',
-             f'& {{ {ps_script} }}', str(src_path), str(dst_path), str(wd_format), str(pid_file)],
+            ['powershell.exe', '-NoProfile', '-NonInteractive', '-STA',
+             '-ExecutionPolicy', 'Bypass', '-File', str(ps_script_file),
+             str(src_path), str(dst_path), str(wd_format), str(pid_file)],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             encoding='utf-8', errors='replace', creationflags=_NO_WINDOW,
         )
         try:
-            stdout, stderr = proc.communicate(timeout=30)
+            stdout, stderr = proc.communicate(timeout=120)
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.communicate()
@@ -353,6 +357,7 @@ def _word_convert(src_path, dst_path, wd_format):
             raise RuntimeError('Word 后台转换超时（可能是 Office 首次启动或弹出授权提示），请先手动打开一次 Word 后重试')
     finally:
         pid_file.unlink(missing_ok=True)
+        ps_script_file.unlink(missing_ok=True)
     if proc.returncode != 0 or not Path(dst_path).exists():
         detail = (stderr or stdout or '').strip().splitlines()
         msg = detail[-1] if detail else 'Word 转换失败，请确认已安装 Microsoft Word 且文件未加密损坏'

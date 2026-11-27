@@ -110,9 +110,12 @@ _WIN_RESERVED_NAMES = {
 
 
 def safe_filename(name):
-    """清洗文件名中的非法字符并规避 Windows 设备保留名（CON/NUL/PRN/COM1 等）。"""
+    """清洗文件名中的非法字符并规避 Windows 设备保留名（保留 .env / .gitignore 等合法开头点号）。"""
     cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', (name or 'file').strip())
-    cleaned = cleaned.strip('. ') or 'file'
+    # Windows 仅禁止文件名末尾点号或空格；开头点号（如 .env、.gitignore）合法，不可吞掉
+    cleaned = cleaned.rstrip('. ').lstrip(' ')
+    if not cleaned or cleaned in ('.', '..'):
+        cleaned = 'file'
     stem_head = cleaned.split('.', 1)[0].upper()
     if stem_head in _WIN_RESERVED_NAMES:
         cleaned = f'_{cleaned}'

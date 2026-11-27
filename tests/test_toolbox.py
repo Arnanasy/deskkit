@@ -539,8 +539,9 @@ class TestServerAndTray(unittest.TestCase):
         import threading
         from urllib.error import HTTPError
         from urllib.parse import quote
-        from urllib.request import Request, urlopen
+        from urllib.request import ProxyHandler, Request, build_opener
         import server
+        urlopen = build_opener(ProxyHandler({})).open
 
         httpd, port = server.create_server(18700)
         tok = httpd.api_token
@@ -825,9 +826,27 @@ class TestServerAndTray(unittest.TestCase):
         self.assertNotIn('My Workspace', san2)
         self.assertNotIn('Private Folder', san2)
 
-        with mock.patch.object(server.os, 'access', return_value=False):
+        with mock.patch.object(server, 'APP_DIR', Path('Z:\\__nonexistent_ro_dir__')):
             fb_log = server._resolve_log_path()
             self.assertEqual(fb_log.parent, Path(tempfile.gettempdir()))
+
+        # 点文件名保留、Big5 字幕识别、上传名防二次解码、视频队列异常复位与 concat 保护
+        self.assertEqual(tools_files.safe_filename('.env'), '.env')
+        self.assertEqual(tools_files.safe_filename('.gitignore'), '.gitignore')
+        self.assertEqual(tools_files.safe_filename('..'), 'file')
+        b5_sub = '1\n00:00:01,000 --> 00:00:03,000\n這是繁體中文字幕測試，請確認臺灣地區顯示正常\n'
+        dec_sub, dec_enc = tools_video._decode_text_bytes(b5_sub.encode('big5'))
+        self.assertEqual(dec_enc, 'big5')
+        self.assertIn('繁體中文字幕', dec_sub)
+
+        mgr_rec = tools_video.VideoTaskManager()
+        mgr_rec._tasks['t1'] = {'id': 't1', 'status': 'running', 'cancelled': False, 'cleanup_paths': ['C:\\tmp\\concat_1.txt']}
+        self.assertIn('C:\\tmp\\concat_1.txt', mgr_rec.active_input_paths())
+        mgr_rec._worker_alive = True
+        with mock.patch.object(mgr_rec, '_run_task', side_effect=PermissionError('locked')):
+            mgr_rec._worker_loop(('t1', [], Path('x.mp4'), 1.0, None))
+        self.assertFalse(mgr_rec._worker_alive)
+        self.assertEqual(mgr_rec._tasks['t1']['status'], 'error')
 
         httpd2, port2 = server.create_server(18730)
         tok2 = httpd2.api_token
@@ -843,6 +862,23 @@ class TestServerAndTray(unittest.TestCase):
                 self.assertEqual(resp403.getheader('Connection'), 'close')
             finally:
                 conn.close()
+
+            # 上传文件名含 %41 不应被二次 URL 解码成 A
+            c_up = http.client.HTTPConnection('127.0.0.1', port2, timeout=3)
+            up_pct_path = None
+            try:
+                c_up.request(
+                    'POST', '/api/upload?name=50%2541%20discount.png',
+                    body=b'pngbytes',
+                    headers={'X-Toolbox-Token': tok2, 'Content-Length': '8'},
+                )
+                up_pct_res = json.loads(c_up.getresponse().read().decode('utf-8'))
+                up_pct_path = Path(up_pct_res['path'])
+                self.assertEqual(up_pct_res['name'], '50%41 discount.png')
+            finally:
+                c_up.close()
+                if up_pct_path is not None:
+                    up_pct_path.unlink(missing_ok=True)
 
             # 6. /api/cleanup-uploads：清理闲置临时上传副本，但保护正在后台队列中的输入文件
             tools_files.ensure_dirs()
