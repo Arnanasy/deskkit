@@ -39,17 +39,31 @@ jobs:
         run: |
           pyinstaller --noconfirm --clean --onefile --windowed ^
             --name DeskKit ^
+            --icon DeskKit.ico ^
             --add-data "web;web" ^
             --hidden-import pillow_heif ^
             --hidden-import pdf2docx ^
             --hidden-import pymupdf ^
             launch.pyw
 
+      - name: 打包 Windows 安装版 DeskKit-Setup.exe（Inno Setup）
+        shell: pwsh
+        run: |
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup -y --no-progress
+          }
+          $ver = if ("${{ inputs.release_tag }}" -ne "") { "${{ inputs.release_tag }}" } elseif ("${{ github.ref_name }}" -like "v*") { "${{ github.ref_name }}" } else { "1.0.0" }
+          $ver = $ver.TrimStart("v")
+          & $iscc "/DMyAppVersion=$ver" installer.iss
+
       - name: 上传构建产物（可在 Actions 页面直接下载）
         uses: actions/upload-artifact@v4
         with:
           name: DeskKit-Windows-x64
-          path: dist/DeskKit.exe
+          path: |
+            dist/DeskKit.exe
+            dist/DeskKit-Setup.exe
 
       - name: 发布到 GitHub Releases
         if: startsWith(github.ref, 'refs/tags/v') || inputs.release_tag != ''
@@ -58,4 +72,6 @@ jobs:
           tag_name: ${{ inputs.release_tag != '' && inputs.release_tag || github.ref_name }}
           name: DeskKit ${{ inputs.release_tag != '' && inputs.release_tag || github.ref_name }}
           generate_release_notes: true
-          files: dist/DeskKit.exe
+          files: |
+            dist/DeskKit.exe
+            dist/DeskKit-Setup.exe
